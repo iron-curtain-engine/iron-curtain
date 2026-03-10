@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025–present Iron Curtain contributors
+
+# Clippy configuration — workspace-wide lint settings.
+#
+# Per-crate clippy configurations (e.g., ic-sim determinism enforcement)
+# will be added as those crates are created. See AGENTS.md Invariant 1.

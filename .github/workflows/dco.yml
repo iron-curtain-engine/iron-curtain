@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025–present Iron Curtain contributors
+
+name: DCO Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  dco:
+    name: DCO Signed-off-by
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check DCO
+        uses: probot/no-response@v1
+        # Simple DCO check: verify all commits have Signed-off-by
+        # Using a lightweight approach — check commit messages directly
+      - name: Verify Signed-off-by
+        run: |
+          MISSING=$(git log --format='%H %s' origin/main..HEAD | while read hash msg; do
+            if ! git log -1 --format='%B' "$hash" | grep -q '^Signed-off-by:'; then
+              echo "$hash $msg"
+            fi
+          done)
+          if [ -n "$MISSING" ]; then
+            echo "::error::The following commits are missing Signed-off-by lines (DCO):"
+            echo "$MISSING"
+            echo ""
+            echo "Please amend your commits with: git commit --amend -s"
+            exit 1
+          fi
+          echo "All commits have Signed-off-by lines."

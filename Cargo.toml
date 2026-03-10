@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025–present Iron Curtain contributors
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/ic-protocol",
+    "crates/ra-formats",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/iron-curtain-engine/iron-curtain"
+authors = ["Iron Curtain contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Standalone IC crates (MIT/Apache-2.0, D076 Tier 1)
+cnc-formats = { version = "0.1", git = "https://github.com/iron-curtain-engine/cnc-formats.git" }
+fixed-game-math = { version = "0.1", git = "https://github.com/iron-curtain-engine/fixed-game-math.git" }
+deterministic-rng = { version = "0.1", git = "https://github.com/iron-curtain-engine/deterministic-rng.git" }
+
+[workspace.lints.clippy]
+# Determinism enforcement: these types are banned in ic-sim
+# (enforced per-crate via clippy.toml disallowed_types)
+float_arithmetic = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
