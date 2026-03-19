@@ -28,9 +28,9 @@ A modern open-source RTS engine in Rust, starting with Command & Conquer.
 Iron Curtain is in early development.
 
 - Active milestone: `M1`
-- Active focus: `G1` resource parsing, with `G2` render scaffolding and `G3`
-  animation work following after
-- Current workspace crates: `ic-protocol`, `ic-cnc-content`
+- Active focus: `G2` render scaffolding on top of completed `G1.1`-`G1.3`
+  content-pipeline foundations
+- Current workspace crates: `ic-protocol`, `ic-cnc-content`, `ic-render`
 - No playable build exists yet
 
 ## Design And Local Rules
@@ -90,6 +90,7 @@ required tools are available on the machine.
 | --- | --- |
 | `ic-protocol` | Shared wire types for the future simulation/network boundary |
 | `ic-cnc-content` | Iron Curtain-side Bevy integration for legacy C&C content loading |
+| `ic-render` | Render-side camera bootstrap and static-scene validation for the future RA viewport |
 
 Additional crates from the full architecture will be added as local
 implementation reaches later milestones.

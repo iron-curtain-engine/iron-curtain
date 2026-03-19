@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025–present Iron Curtain contributors
+
+[package]
+name = "ic-render"
+version = "0.1.0"
+description = "Iron Curtain render-side camera and scene integration"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bevy = { version = "0.18.1", default-features = false, features = [
+    "bevy_asset",
+] }
+ic-cnc-content = { path = "../ic-cnc-content" }
+thiserror = "2.0.18"

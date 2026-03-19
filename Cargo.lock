@@ -1065,6 +1065,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ic-render"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "ic-cnc-content",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

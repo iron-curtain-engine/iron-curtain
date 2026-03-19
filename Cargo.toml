@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/ic-protocol", "crates/ic-cnc-content"]
+members = ["crates/ic-protocol", "crates/ic-cnc-content", "crates/ic-render"]
 
 [workspace.package]
 edition = "2021"

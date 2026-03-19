@@ -17,6 +17,7 @@ restructure APIs and workspace layout aggressively.
 - `G1.1` source probe contract and source-manifest snapshot schema in `ic-cnc-content`
 - `G1.2` importer-facing `.mix` staging helpers with duplicate-CRC-safe extraction
 - `G1.3` `.shp` / `.pal` parser-to-render handoff metadata for the future render crate
+- Initial `ic-render` crate with camera bootstrap, classic isometric projection math, and static-scene validation
 
 ### Changed
 
