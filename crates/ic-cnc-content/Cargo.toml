@@ -12,7 +12,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-cnc-formats = { workspace = true, features = ["encrypted-mix", "miniyaml"] }
+cnc-formats = { workspace = true, features = ["encrypted-mix", "meg", "miniyaml"] }
 bevy = { version = "0.18.1", default-features = false, features = [
     "bevy_asset",
 ] }

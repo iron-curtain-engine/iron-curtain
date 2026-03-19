@@ -22,19 +22,38 @@ missing, contradictory, or infeasible. Follow the design-gap workflow in
 Run the same core checks locally before opening a PR:
 
 ```bash
-./ci-local.sh
+./ci lint
+./ci test
+./ci all
 ```
 
 On Windows PowerShell:
 
 ```powershell
-./ci-local.ps1
+./ci.ps1 lint
+./ci.ps1 test
+./ci.ps1 all
 ```
 
-These scripts aim to track the repository’s GitHub Actions checks:
+The underlying host-native wrappers remain available when you want them
+directly:
+
+```powershell
+./ci-local.ps1 lint
+./ci-local.ps1 test
+./ci-local.ps1 all
+```
+
+`ci` is the stable repo entrypoint. It dispatches to the host-native wrapper
+for the current shell so contributors and agents do not have to remember the
+underlying script names. `lint` is the preferred first pass because it catches
+compile and lint issues before the slower test run. `test` reruns only the
+workspace tests once lint is already green, and `all` adds the optional
+repo-policy checks.
+
+The core checks are:
 
 - `cargo fmt --all --check`
-- `cargo check --workspace --all-targets --locked`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --workspace --locked`
 - `cargo doc --workspace --no-deps --locked`
@@ -44,7 +63,7 @@ These scripts aim to track the repository’s GitHub Actions checks:
 
 `cargo deny`, `cargo audit`, and MSRV checks depend on the corresponding local
 tools being installed. GitHub Actions remains the authoritative enforcement
-path.
+path and runs `check` / `clippy` / `test` on Ubuntu, Windows, and macOS.
 
 ## Pull Requests
 

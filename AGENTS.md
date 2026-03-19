@@ -112,7 +112,7 @@ Related decisions: D012, D041
 | Crate            | Responsibility                                                                                 | Phase |
 | ---------------- | ---------------------------------------------------------------------------------------------- | ----- |
 | `ic-protocol`    | Shared serializable types (`PlayerOrder`, `TimestampedOrder`, `TickOrders`, `MessageLane`)     | 0     |
-| `ic-cnc-content` | Iron Curtain-side C&C content integration (`.mix`, `.shp`, `.pal`, `.aud`, `.vqa`, MiniYAML)  | 0–1   |
+| `ic-cnc-content` | Iron Curtain-side C&C content integration (`.mix`, `.shp`, `.pal`, `.aud`, `.vqa`, MiniYAML)   | 0–1   |
 | `ic-paths`       | Platform path resolution (XDG/APPDATA/portable mode)                                           | 1     |
 | `ic-sim`         | Pure deterministic simulation (fixed-point, no I/O, no floats)                                 | 2     |
 | `ic-render`      | Bevy isometric map/sprite renderer, camera, fog rendering                                      | 1     |
@@ -323,7 +323,11 @@ Do **not** open a request for:
 - **Test:** `cargo test --workspace --locked`
 - **Lint:** `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - **Format:** `cargo fmt --all --check`
-- **CI expectations:** All tests pass, clippy clean (zero warnings), fmt check clean. `clippy::disallowed_types` enforces determinism rules in `ic-sim`
+- **Build/run rule:** Agents must **not** use `cargo build`, `cargo run`, or equivalent binary/example launch commands for this repo unless the user explicitly requests them. Let the user build and run the project in their own environment.
+- **Why this rule exists:** The agent environment may not match the user's local graphics, windowing, driver, audio, or platform setup. Pure build/run attempts can waste time while proving less than the same compile work done through targeted tests or lint checks.
+- **Allowed verification paths:** `cargo clippy`, `cargo test`, `cargo check`, `cargo fmt --check`, `./ci`, `ci-local.sh`, `ci-local.ps1`, and other non-run validation commands are allowed. Prefer the repo dispatcher first, then direct cargo commands when a narrower probe is enough.
+- **Host-native validation rule:** `cfg(target_os)` and other platform-gated code is only considered validated when linted on that host OS or by the GitHub Actions OS matrix. Use `./ci lint` on Unix-like hosts, `./ci lint --host windows` from WSL when Windows PowerShell is available, and `.\ci.ps1 lint` on native Windows before claiming platform-specific code is green.
+- **CI expectations:** All tests pass, clippy clean (zero warnings), fmt check clean, and the GitHub Actions matrix stays green on Ubuntu, Windows, and macOS. `clippy::disallowed_types` enforces determinism rules in `ic-sim`
 - **Perf profiling:** `cargo bench` for hot-path microbenchmarks; Tracy/Superluminal for frame profiling
 - **Security constraints:** No `unsafe` without review comment. WASM mods use capability-gated API only (D005). Order validation is deterministic (D012). Replay hashes use Ed25519 signing (D010)
 
@@ -333,6 +337,9 @@ Do **not** open a request for:
 - Prefer targeted file reads over repo-wide scans once the index points to likely files
 - Use canonical design docs (linked above) for behavior decisions; use local code/docs for implementation specifics
 - If docs and code conflict, treat this as a design-gap or stale-code-index problem and report it — do not silently override
+- Never use `cargo build`, `cargo run`, or similar pure build/run commands unless the user explicitly asks; prefer `cargo clippy` first, then `cargo test`, and use `cargo check` as a lighter fallback
+- Treat `./ci lint` as the preferred repo-level validation entrypoint before falling back to `ci-local.*` or ad-hoc cargo commands for partial checks
+- When a task would normally end with “run the app locally”, provide the exact user-run command instead of executing it yourself
 - Never introduce `f32`/`f64`/`HashMap`/`HashSet` in `ic-sim` — CI will reject it
 - Never add I/O (file, network, clock) to `ic-sim`
 - Never add `ic-net` imports to `ic-sim` or `ic-sim` imports to `ic-net`
@@ -350,7 +357,7 @@ Do not claim a feature is complete without evidence:
 ## Current Implementation Target (Update Regularly)
 
 - Active milestone: `M1`
-- Active `G*` steps: `G2` (Bevy window/bootstrap render slice), with `G1` content-pipeline foundations feeding it and `G3` (unit animation) next
+- Active `G*` steps: `G2` (Bevy content-lab/bootstrap render slice), with `G1` content-pipeline foundations feeding it and `G3` (unit animation) next
 - Current blockers: none known
 - Parallel work lanes allowed: `G1` and `G2` can overlap (parser feeds renderer)
 

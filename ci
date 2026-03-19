@@ -1,0 +1,101 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025-present Iron Curtain contributors
+
+# ci - Stable top-level validation entrypoint for Unix-like shells.
+#
+# This is a thin dispatcher over the host-native wrappers:
+# - `ci-local.sh` owns Unix-like validation
+# - `ci-local.ps1` owns Windows validation
+#
+# Keeping the dispatcher thin avoids duplicating policy while still giving
+# humans and agents one stable command name to remember in this repo.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MODE="all"
+HOST="auto"
+
+usage() {
+    cat <<'EOF'
+Usage: ./ci [lint|test|all|quick] [--host auto|unix|windows]
+
+Examples:
+  ./ci lint
+  ./ci test
+  ./ci all
+  ./ci lint --host windows
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        lint|test|all|quick)
+            MODE="$1"
+            shift
+            ;;
+        --host)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --host requires auto, unix, or windows" >&2
+                usage
+                exit 2
+            fi
+            HOST="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unsupported argument '$1'" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+case "$HOST" in
+    auto)
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*)
+                HOST="windows"
+                ;;
+            *)
+                HOST="unix"
+                ;;
+        esac
+        ;;
+    unix|windows)
+        ;;
+    *)
+        echo "ERROR: unsupported host '$HOST'" >&2
+        usage
+        exit 2
+        ;;
+esac
+
+if [[ "$HOST" == "unix" ]]; then
+    exec "$ROOT_DIR/ci-local.sh" "$MODE"
+fi
+
+if command -v wslpath >/dev/null 2>&1; then
+    POWERSHELL_SCRIPT_PATH="$(wslpath -w "$ROOT_DIR/ci-local.ps1")"
+elif command -v cygpath >/dev/null 2>&1; then
+    POWERSHELL_SCRIPT_PATH="$(cygpath -w "$ROOT_DIR/ci-local.ps1")"
+else
+    echo "ERROR: Windows dispatch requires wslpath or cygpath to translate the PowerShell script path." >&2
+    exit 1
+fi
+
+if command -v powershell.exe >/dev/null 2>&1; then
+    exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$POWERSHELL_SCRIPT_PATH" -Mode "$MODE"
+fi
+
+if command -v pwsh.exe >/dev/null 2>&1; then
+    exec pwsh.exe -NoProfile -File "$POWERSHELL_SCRIPT_PATH" -Mode "$MODE"
+fi
+
+echo "ERROR: PowerShell is not available for Windows dispatch." >&2
+exit 1

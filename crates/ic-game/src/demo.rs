@@ -168,7 +168,12 @@ pub fn run_demo_client() -> Result<(), DemoSceneError> {
 /// `Startup` system runs once before the first frame. This is the right place
 /// for the first window proof because we only need one camera, one texture,
 /// and one sprite entity.
-fn setup_demo_scene(
+/// Startup system that spawns the synthetic background sprite used by the
+/// current bootstrap clients.
+///
+/// `content_window` reuses this instead of duplicating the temporary render
+/// proof while the real viewers are still under construction.
+pub(crate) fn setup_demo_scene(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut static_scene: ResMut<StaticRenderScene>,

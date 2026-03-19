@@ -84,6 +84,34 @@ pub struct RgbaSpriteFrame {
 }
 
 impl RgbaSpriteFrame {
+    /// Creates one validated RGBA8888 frame.
+    ///
+    /// Some content-lab previewers, such as waveform, LUT, and text-driven
+    /// diagnostic images, do not start from palette-indexed pixels. This
+    /// constructor gives those tooling paths the same width/height validation
+    /// that indexed bootstrap frames already receive.
+    pub fn from_rgba(
+        width: u32,
+        height: u32,
+        rgba8: Vec<u8>,
+    ) -> Result<Self, SpriteBootstrapError> {
+        let expected = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if rgba8.len() != expected {
+            return Err(SpriteBootstrapError::PixelCountMismatch {
+                expected,
+                actual: rgba8.len(),
+            });
+        }
+
+        Ok(Self {
+            width,
+            height,
+            rgba8,
+        })
+    }
+
     /// Width of the expanded sprite frame in pixels.
     pub fn width(&self) -> u32 {
         self.width

@@ -21,6 +21,7 @@ use bevy::app::{App, Plugin};
 use bevy::asset::AssetApp;
 
 pub mod aud;
+pub mod meg;
 pub mod miniyaml;
 pub mod mix;
 pub mod pal;
@@ -37,8 +38,8 @@ pub use cnc_formats;
 /// Registers all legacy C&C content `AssetLoader`s with the Bevy app.
 ///
 /// This plugin is the crate's main integration seam: engine code depends on it
-/// to make `.mix`, `.shp`, `.pal`, `.aud`, `.vqa`, and explicit `.miniyaml`
-/// assets available through Bevy's asset system.
+/// to make `.mix`, `.meg`, `.shp`, `.pal`, `.aud`, `.vqa`, and explicit
+/// `.miniyaml` assets available through Bevy's asset system.
 pub struct IcCncContentPlugin;
 
 impl Plugin for IcCncContentPlugin {
@@ -50,6 +51,8 @@ impl Plugin for IcCncContentPlugin {
         // file with that loader's supported extension is requested.
         app.init_asset::<mix::MixArchive>()
             .init_asset_loader::<mix::MixLoader>()
+            .init_asset::<meg::MegArchive>()
+            .init_asset_loader::<meg::MegLoader>()
             .init_asset::<shp::ShpSprite>()
             .init_asset_loader::<shp::ShpLoader>()
             .init_asset::<pal::Palette>()

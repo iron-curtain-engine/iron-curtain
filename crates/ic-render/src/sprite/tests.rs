@@ -47,3 +47,19 @@ fn indexed_frame_rejects_pixel_count_mismatch() {
         }
     );
 }
+
+/// Proves that direct RGBA bootstrap frames validate the byte count before the
+/// content lab turns diagnostic images into Bevy textures.
+#[test]
+fn rgba_frame_rejects_pixel_count_mismatch() {
+    let error =
+        RgbaSpriteFrame::from_rgba(2, 2, vec![255; 12]).expect_err("pixel count should fail");
+
+    assert_eq!(
+        error,
+        SpriteBootstrapError::PixelCountMismatch {
+            expected: 16,
+            actual: 12,
+        }
+    );
+}
