@@ -3,10 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = [
-    "crates/ic-protocol",
-    "crates/ra-formats",
-]
+members = ["crates/ic-protocol", "crates/ic-cnc-content"]
 
 [workspace.package]
 edition = "2021"
@@ -17,10 +14,10 @@ authors = ["Iron Curtain contributors"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = "=0.9.33"
 
 # Standalone IC crates (MIT/Apache-2.0, D076 Tier 1)
-cnc-formats = { version = "0.1", git = "https://github.com/iron-curtain-engine/cnc-formats.git" }
+cnc-formats = { version = "0.1.0-alpha.1", git = "https://github.com/iron-curtain-engine/cnc-formats.git", rev = "98282ace03da8c11276dd658e5a3d9fc0344c4f5", default-features = false }
 fixed-game-math = { version = "0.1", git = "https://github.com/iron-curtain-engine/fixed-game-math.git" }
 deterministic-rng = { version = "0.1", git = "https://github.com/iron-curtain-engine/deterministic-rng.git" }
 

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025–present Iron Curtain contributors
+
+[package]
+name = "ic-cnc-content"
+version = "0.1.0"
+description = "Iron Curtain Command & Conquer content integration"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cnc-formats = { workspace = true, features = ["encrypted-mix", "miniyaml"] }
+bevy = { version = "0.18.1", default-features = false, features = [
+    "bevy_asset",
+] }
+serde = { workspace = true }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

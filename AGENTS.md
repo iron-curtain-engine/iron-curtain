@@ -3,6 +3,22 @@
 > Local implementation rules for the IC engine/game code repository.
 > Canonical design authority lives in the Iron Curtain design-doc repository.
 
+## Maintaining This File
+
+AGENTS.md is read by stateless agents with no memory of prior sessions.
+Every rule must stand on its own without session context.
+
+- **General, not reactive.** Do not add rules just to memorialize one past
+  mistake. Only codify patterns likely to recur across many sessions.
+- **Context-free.** No references to specific conversations, commit hashes,
+  or session artifacts. A future agent must understand every rule in
+  isolation.
+- **Principles over anecdotes.** Prefer durable guidance over story-like
+  explanations of why a rule was added.
+- **No stale specifics.** If a rule names a concrete file, crate, or command,
+  it must be because that item is structurally important, not because it was
+  the subject of a one-time debate.
+
 ## Canonical Design Authority (Do Not Override Locally)
 
 This repository implements the Iron Curtain design. The canonical design sources are:
@@ -23,6 +39,9 @@ Primary canonical planning and design references:
 - `src/architecture/type-safety.md` — newtype policy, fixed-point math, typestate, verified wrappers
 - `src/architecture/crate-graph.md` — crate dependency DAG, async architecture, IoBridge trait
 - `src/LLM-INDEX.md` — retrieval routing for humans/LLMs
+- `src/16-CODING-STANDARDS.md` — file structure, commenting, naming, error handling, testing
+- `src/coding-standards/quality-review.md` — review checklist and code quality bar
+- `src/14-METHODOLOGY.md` — work-unit discipline and evidence requirements
 
 ## Non-Negotiable Rule: No Silent Design Divergence
 
@@ -90,22 +109,22 @@ Related decisions: D012, D041
 
 ## Crate Workspace
 
-| Crate         | Responsibility                                                                                 | Phase |
-| ------------- | ---------------------------------------------------------------------------------------------- | ----- |
-| `ic-protocol` | Shared serializable types (`PlayerOrder`, `TimestampedOrder`, `TickOrders`, `MessageLane`)     | 0     |
-| `ra-formats`  | RA1 asset parsing (`.mix`, `.shp`, `.pal`, `.aud`, `.vqa`, MiniYAML)                           | 0–1   |
-| `ic-paths`    | Platform path resolution (XDG/APPDATA/portable mode)                                           | 1     |
-| `ic-sim`      | Pure deterministic simulation (fixed-point, no I/O, no floats)                                 | 2     |
-| `ic-render`   | Bevy isometric map/sprite renderer, camera, fog rendering                                      | 1     |
-| `ic-ui`       | Game UI and chrome (Bevy UI), sidebar, power bar, selection, menus                             | 3–4   |
-| `ic-audio`    | Sound, music, EVA via Kira backend                                                             | 3     |
-| `ic-net`      | `NetworkModel` implementations, `RelayCore` library                                            | 5     |
-| `ic-server`   | Unified server binary (D074): relay + optional headless sim for FogAuth/cross-engine           | 5     |
-| `ic-script`   | Lua (`mlua`) and WASM (`wasmtime`) mod runtimes, deterministic sandbox                         | 4–5   |
-| `ic-ai`       | Skirmish AI (`PersonalityDrivenAi`), adaptive difficulty, economy/production/military managers | 4–6   |
-| `ic-llm`      | LLM integration for adaptive missions, briefings, coaching (D016, D044, D073)                  | 6+    |
-| `ic-editor`   | SDK: scenario editor, asset studio, campaign editor (D038, D040)                               | 6a–6b |
-| `ic-game`     | Main game client binary — Bevy ECS orchestration, ties all systems together                    | 2+    |
+| Crate            | Responsibility                                                                                 | Phase |
+| ---------------- | ---------------------------------------------------------------------------------------------- | ----- |
+| `ic-protocol`    | Shared serializable types (`PlayerOrder`, `TimestampedOrder`, `TickOrders`, `MessageLane`)     | 0     |
+| `ic-cnc-content` | Iron Curtain-side C&C content integration (`.mix`, `.shp`, `.pal`, `.aud`, `.vqa`, MiniYAML)  | 0–1   |
+| `ic-paths`       | Platform path resolution (XDG/APPDATA/portable mode)                                           | 1     |
+| `ic-sim`         | Pure deterministic simulation (fixed-point, no I/O, no floats)                                 | 2     |
+| `ic-render`      | Bevy isometric map/sprite renderer, camera, fog rendering                                      | 1     |
+| `ic-ui`          | Game UI and chrome (Bevy UI), sidebar, power bar, selection, menus                             | 3–4   |
+| `ic-audio`       | Sound, music, EVA via Kira backend                                                             | 3     |
+| `ic-net`         | `NetworkModel` implementations, `RelayCore` library                                            | 5     |
+| `ic-server`      | Unified server binary (D074): relay + optional headless sim for FogAuth/cross-engine           | 5     |
+| `ic-script`      | Lua (`mlua`) and WASM (`wasmtime`) mod runtimes, deterministic sandbox                         | 4–5   |
+| `ic-ai`          | Skirmish AI (`PersonalityDrivenAi`), adaptive difficulty, economy/production/military managers | 4–6   |
+| `ic-llm`         | LLM integration for adaptive missions, briefings, coaching (D016, D044, D073)                  | 6+    |
+| `ic-editor`      | SDK: scenario editor, asset studio, campaign editor (D038, D040)                               | 6a–6b |
+| `ic-game`        | Main game client binary — Bevy ECS orchestration, ties all systems together                    | 2+    |
 
 **Critical crate boundaries:**
 
@@ -156,6 +175,111 @@ This repo must maintain a code navigation file for humans and LLMs:
 See the filled-in template in the design docs at `src/tracking/ic-engine-code-index.md` for the initial version to copy.
 
 Update `CODE-INDEX.md` in the same change set when code layout changes.
+
+## Coding Session Discipline (Required)
+
+These rules govern how implementation work is carried out in this repository.
+They are not optional style preferences.
+
+### 1. Test-First / Proof-First
+
+- For every non-trivial behavior change, bug fix, parser rule, state
+  transition, serialization path, boundary condition, or regression fix:
+  **write or update the tests first** so the expected behavior is explicit
+  before implementation changes begin.
+- Tests are not cleanup. They are the primary proof artifact that the design
+  was understood correctly and implemented correctly.
+- The intended workflow is **red → green → refactor**:
+  1. encode the requirement in a test
+  2. observe the old implementation fail or lack the behavior
+  3. implement the change
+  4. rerun the tests to prove the new behavior
+- If a task is purely structural (rename, move, formatting, comment-only
+  cleanup) and has no behavioral delta, a new failing test is not required.
+  But any task that changes runtime behavior must be test-led.
+- If a true test-first path is impossible for a narrow case (for example,
+  infrastructure scaffolding with no callable surface yet), document why and
+  add the nearest executable proof in the same change set before claiming the
+  work complete.
+- When closing work, call out the exact tests, demos, replay captures, or
+  benchmark artifacts that serve as evidence. "Implemented" without proof is
+  not acceptable.
+
+### 2. Commenting and Documentation for Context Isolation
+
+- Write comments for the reader who lacks project context: a new maintainer,
+  an occasional contributor, or an LLM reading one file in isolation.
+- Every non-trivial module should begin with `//!` module docs that explain:
+  - what the module owns
+  - where it fits in the crate / system / pipeline
+  - what depends on it or feeds into it
+- Public structs, enums, error types, traits, and non-trivial functions or
+  methods should have `///` doc comments that explain:
+  - **what** the item does
+  - **why** it exists / why this approach was chosen
+  - important invariants, edge cases, and failure modes
+- Inline `//` comments are required for non-obvious logic, algorithm phases,
+  workarounds, safety guards, and domain-specific choices. Comments should
+  explain *why this code is written this way*, not merely restate syntax.
+- When code depends on an external framework, engine subsystem, or specialized
+  library that a capable Rust reader may not already know, comments must teach
+  the local mental model instead of assuming prior familiarity.
+- For Bevy code in particular, explain the role of the Bevy concepts in use:
+  what a `Plugin`, `App`, `System`, `Component`, `Resource`, `Asset`,
+  `AssetLoader`, `Handle`, schedule hook, query, or event is doing in this
+  specific file, and what behavior the engine is trying to achieve with it.
+- Write framework-facing comments as onboarding notes for a maintainer learning
+  the framework while reading the code. The standard is: the reader should be
+  able to understand both **what this Bevy or library code does** and **why
+  this project uses that mechanism here** without consulting outside material.
+- Apply the same teaching standard to tests and setup code when they use
+  framework-specific APIs, fixtures, lifecycle hooks, or builder patterns that
+  would otherwise be opaque to a reader.
+- Do not turn comments into line-by-line paraphrases of syntax. Focus on
+  concepts, runtime behavior, ownership boundaries, data flow, and the reason a
+  given framework feature was chosen over simpler or more direct alternatives.
+- Constants and magic numbers must be documented with their origin and meaning
+  when that meaning is not self-evident.
+- Temporary workarounds, placeholders, and deferred behavior must be marked
+  explicitly with the reason, scope limit, and blocker or later phase where
+  they should be revisited.
+- Avoid obvious comments like "increment counter". The code already says that.
+  Spend comments on context, rationale, and constraints.
+
+### 3. Test Documentation Standard
+
+- Tests are part of the permanent design record. They must be readable without
+  reverse-engineering the test body.
+- Every non-trivial `#[test]` should have a `///` doc comment describing:
+  - **what** scenario is being tested
+  - **why** the scenario matters (bug, invariant, boundary, regression, security risk)
+  - **how** the test is constructed when that is not obvious from the code
+- Test names should describe the behavioral contract, not just the function
+  under test.
+- Test helpers must carry the same documentation standard as production code
+  if they encode non-obvious binary layouts, fixtures, determinism setup, or
+  scenario construction.
+
+### 4. RAG / LLM-Friendly Project Tree
+
+- The repository must stay navigable when read through file-by-file search,
+  embeddings, or a limited context window. Structure the tree so a reader can
+  load only the relevant files for the task at hand.
+- Prefer small focused files over giant mixed-purpose files. As a rule of
+  thumb, split files before they become hard to read in one pass; **~600 lines
+  is the soft ceiling** for either production code or test files.
+- For non-trivial modules, separate production code from heavy test scaffolding
+  using directory modules such as:
+  - `foo/mod.rs` for production logic
+  - `foo/tests.rs` for unit tests
+  - `foo/tests_validation.rs` or similarly named files for boundary/security/diagnostic tests when needed
+- Keep test-only builders, fixtures, and scaffolding in test files unless they
+  are genuinely shared by production code.
+- Favor a stable top-to-bottom file layout so any reader knows where to look:
+  module docs → imports → constants → types → impl blocks / functions → tests.
+- When crate layout, module layout, or ownership boundaries change, update
+  `CODE-INDEX.md` in the same change set so humans and LLMs can still route
+  to the right files immediately.
 
 ## Design Change Escalation Workflow
 

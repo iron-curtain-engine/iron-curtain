@@ -1,68 +1,128 @@
 # Iron Curtain
 
-A modern, open-source RTS engine built in Rust — starting with Command & Conquer.
+<p align="center">
+  <img src="images/logo.png" alt="Iron Curtain logo" width="280">
+</p>
 
-*Red Alert first. Tiberian Dawn alongside it. The rest of the C&C family to follow.*
+<p align="center">
+  <a href="https://github.com/iron-curtain-engine/iron-curtain/actions/workflows/ci.yml"><img src="https://github.com/iron-curtain-engine/iron-curtain/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/iron-curtain-engine/iron-curtain/actions/workflows/audit.yml"><img src="https://github.com/iron-curtain-engine/iron-curtain/actions/workflows/audit.yml/badge.svg" alt="Security Audit"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust"></a>
+  &nbsp;&nbsp;
+  <img src="https://img.shields.io/badge/LM-ready-blueviolet.svg" alt="LM Ready"><br>
+  <img src="images/rust_inside.png" alt="Rust-based project" width="74">
+  &nbsp;
+  <img src="images/lm_ready.png" alt="LM Ready" width="74">
+</p>
+
+A modern open-source RTS engine in Rust, starting with Command & Conquer.
+
+*Red Alert first. Tiberian Dawn alongside it. The rest of the C&C family follows later.*
 
 ## Status
 
-> ⚠️ **Early development** — Phase 0 (Foundation & Format Literacy). No playable build exists yet.
+Iron Curtain is in early development.
 
-## Design Documents
+- Active milestone: `M1`
+- Active focus: `G1` resource parsing, with `G2` render scaffolding and `G3`
+  animation work following after
+- Current workspace crates: `ic-protocol`, `ic-cnc-content`
+- No playable build exists yet
 
-All architectural decisions, design rationale, and roadmap are maintained in the
-[Iron Curtain Design Documentation](https://github.com/iron-curtain-engine/iron-curtain-design-docs)
-repository. The hosted book is available at:
+## Design And Local Rules
+
+Canonical architecture, roadmap, and design rationale live in the
+[Iron Curtain design-doc repository](https://github.com/iron-curtain-engine/iron-curtain-design-docs).
+The hosted book is:
 
 **<https://iron-curtain-engine.github.io/iron-curtain-design-docs/>**
 
-Read `AGENTS.md` in this repo for implementation-specific rules.
+For local implementation work in this repo, read:
+
+- `AGENTS.md` for coding-session rules and architectural invariants
+- `CODE-INDEX.md` for current-file routing and repo navigation
+
+## Repo Family
+
+Iron Curtain is one repository in the wider `iron-curtain-engine` family.
+Sibling repos currently include:
+
+| Repository | Role |
+| --- | --- |
+| [`iron-curtain-design-docs`](https://github.com/iron-curtain-engine/iron-curtain-design-docs) | Canonical architecture, roadmap, and design decisions |
+| [`cnc-formats`](https://github.com/iron-curtain-engine/cnc-formats) | Clean-room C&C binary format parsers and conversion tooling |
+| [`fixed-game-math`](https://github.com/iron-curtain-engine/fixed-game-math) | Deterministic fixed-point math crate |
+| [`deterministic-rng`](https://github.com/iron-curtain-engine/deterministic-rng) | Platform-identical deterministic random number generator |
 
 ## Building
 
 ```bash
 cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo deny check licenses
+cargo fmt --all --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-## Crate Structure
+You can also run the repo-local CI wrapper:
 
-| Crate          | Purpose                                              |
-| -------------- | ---------------------------------------------------- |
-| `ic-protocol`  | Shared wire types (`PlayerOrder`, `TimestampedOrder`) |
-| `ra-formats`   | RA1 asset parsers (`.mix`, `.shp`, `.pal`, `.aud`)   |
+```bash
+./ci-local.sh
+```
 
-Additional crates will be added as development progresses through the
-[milestone roadmap](https://iron-curtain-engine.github.io/iron-curtain-design-docs/08-ROADMAP.html).
+Or on PowerShell:
+
+```powershell
+./ci-local.ps1
+```
+
+The local CI wrappers aim to stay aligned with the GitHub Actions flow.
+GitHub Actions is the authoritative enforcement path for documentation, MSRV,
+license, and security-audit checks; the local scripts run those checks when the
+required tools are available on the machine.
+
+## Current Crates
+
+| Crate | Purpose |
+| --- | --- |
+| `ic-protocol` | Shared wire types for the future simulation/network boundary |
+| `ic-cnc-content` | Iron Curtain-side Bevy integration for legacy C&C content loading |
+
+Additional crates from the full architecture will be added as local
+implementation reaches later milestones.
 
 ## Standalone Crates (MIT/Apache-2.0)
 
-These general-purpose libraries are extracted into separate repositories
-under permissive licenses for maximum community reuse (D076):
+These general-purpose libraries live in separate repositories under permissive
+licenses for reuse outside the engine (D076):
 
-| Crate               | Repository                                                                     | Purpose                              |
-| -------------------- | ------------------------------------------------------------------------------ | ------------------------------------ |
-| `cnc-formats`        | [cnc-formats](https://github.com/iron-curtain-engine/cnc-formats)              | Clean-room C&C binary format parsers |
-| `fixed-game-math`    | [fixed-game-math](https://github.com/iron-curtain-engine/fixed-game-math)      | Deterministic fixed-point arithmetic |
-| `deterministic-rng`  | [deterministic-rng](https://github.com/iron-curtain-engine/deterministic-rng)  | Seedable platform-identical PRNG     |
+| Crate | Repository | Purpose |
+| --- | --- | --- |
+| `cnc-formats` | [cnc-formats](https://github.com/iron-curtain-engine/cnc-formats) | Clean-room C&C binary format parsers |
+| `fixed-game-math` | [fixed-game-math](https://github.com/iron-curtain-engine/fixed-game-math) | Deterministic fixed-point arithmetic |
+| `deterministic-rng` | [deterministic-rng](https://github.com/iron-curtain-engine/deterministic-rng) | Seedable platform-identical PRNG |
 
 ## Contributing
 
-Interested in Rust game dev, RTS design, format parsing, networking, AI/ML, or art — open an issue or say hello.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
 
-All contributions require a Developer Certificate of Origin (DCO) — add `Signed-off-by` to your commit messages (`git commit -s`).
+All contributions require a Developer Certificate of Origin (DCO). Add
+`Signed-off-by` to your commits with `git commit -s`.
 
 ## License
 
-Engine source code is licensed under **GPL-3.0-or-later** with an explicit modding exception
-(YAML, Lua, and WASM mods loaded through the engine's data interfaces are NOT derivative works).
+Engine source code is licensed under **GPL-3.0-or-later** with the project’s
+modding exception. YAML, Lua, and WASM mods loaded through the engine’s data
+interfaces are not treated as derivative works.
+
 See [LICENSE](LICENSE) for the full text.
 
 ## Trademark Disclaimer
 
-Red Alert, Tiberian Dawn, Command & Conquer, and C&C are trademarks of Electronic Arts Inc.
-Iron Curtain is **not** affiliated with, endorsed by, or sponsored by Electronic Arts.
-These names are used solely to identify the games and formats the engine is designed to be
-compatible with (nominative fair use).
+Red Alert, Tiberian Dawn, Command & Conquer, and C&C are trademarks of
+Electronic Arts Inc. Iron Curtain is not affiliated with, endorsed by, or
+sponsored by Electronic Arts. These names are used only to identify the games
+and formats the engine is intended to interoperate with.

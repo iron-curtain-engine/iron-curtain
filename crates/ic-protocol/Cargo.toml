@@ -15,4 +15,4 @@ authors.workspace = true
 serde = { workspace = true }
 
 [dev-dependencies]
-serde_yaml = "0.9"
+serde_yaml = { workspace = true }

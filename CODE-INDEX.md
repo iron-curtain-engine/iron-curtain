@@ -3,309 +3,185 @@
 > Source code navigation index for humans and LLMs.
 > Canonical design authority: `https://github.com/iron-curtain-engine/iron-curtain-design-docs` @ `HEAD`
 
-## How to Use This Index
+## How To Use This Index
 
-- Start with the **Task Routing** section to find the right subsystem
-- Read the **Subsystem Index** entry before editing any crate
-- Follow the **Do Not Edit / Generated** notes
-- Use the linked tests/profiles as proof paths for changes
-- If this index and the code disagree, the code is stale or this index needs updating — report it
+- Start with **Current Repo State** so you know which crates and repo files
+  actually exist locally.
+- Use **Task Routing** to jump to the right file set for the job in front of you.
+- Read the subsystem entry before editing a crate.
+- If this index and the code disagree, update this file in the same change set.
 
-## Current Scope / Build Target
+## Current Repo State
 
 - Active milestone(s): `M1`
-- Active `G*` step(s): `G1` (asset parsing), `G2` (isometric render), `G3` (unit animation)
-- Current focus area(s): RA resource loading pipeline → Bevy rendering slice
-- Known blockers (`Pxxx` / external): none
+- Active `G*` step(s): `G1` primary, with `G2` and `G3` planned next
+- Current implemented Rust crates:
+  - `crates/ic-protocol`
+  - `crates/ic-cnc-content`
+- Current repo-ops files now maintained locally:
+  - `AGENTS.md`
+  - `CODE-INDEX.md`
+  - `README.md`
+  - `CONTRIBUTING.md`
+  - `CHANGELOG.md`
+  - `ci-local.sh`
+  - `ci-local.ps1`
+  - `.github/workflows/ci.yml`
+  - `.github/workflows/audit.yml`
+  - `.github/workflows/dco.yml`
+- Current placeholder directories with no substantive implementation yet:
+  - `tests/`
+  - `assets/`
+  - `docs/design-gap-requests/`
+  - `docs/implementation-notes/`
+- Planned crates such as `ic-sim`, `ic-render`, `ic-ui`, `ic-net`, and others
+  are design-level architecture only right now. They do not exist in this repo
+  yet and must not be treated as editable local code paths.
 
-## Task Routing (Start Here For X)
+## Task Routing
 
-| If you need to...                         | Start here                       | Then read                                                         | Avoid touching first           |
-| ----------------------------------------- | -------------------------------- | ----------------------------------------------------------------- | ------------------------------ |
-| Parse RA1 assets (.mix, .shp, .pal, .aud) | `crates/ra-formats/`             | format tests, `src/05-FORMATS.md`                                 | sim/net/render paths           |
-| Implement deterministic sim behavior      | `crates/ic-sim/`                 | `ic-protocol/`, conformance tests                                 | render/UI/net paths            |
-| Work on netcode / relay timing            | `crates/ic-net/`                 | `ic-protocol/`, `src/03-NETCODE.md`                               | `ic-sim` internals             |
-| Add UI/HUD feature                        | `crates/ic-ui/`                  | `ic-render/`, `src/17-PLAYER-FLOW.md`                             | core sim/net paths             |
-| Add renderer feature (sprites, map, fog)  | `crates/ic-render/`              | `ic-sim/` read-only state, Bevy docs                              | sim mutation, net internals    |
-| Add audio/music/EVA                       | `crates/ic-audio/`               | `ra-formats/` for .aud parsing, Kira docs                         | sim/net/render internals       |
-| Add Lua/WASM mod feature                  | `crates/ic-script/`              | `ic-sim/` trait surface, `src/04-MODDING.md`                      | sim internals beyond trait API |
-| Add AI behavior                           | `crates/ic-ai/`                  | `ic-sim/` read view, `ic-protocol/` orders                        | net/render/UI paths            |
-| Add LLM integration feature               | `crates/ic-llm/`                 | `ic-sim/`, `ic-script/`, `src/decisions/09f/D016-llm-missions.md` | core sim/net hot paths         |
-| Fix pathfinding bug                       | `crates/ic-sim/src/pathfinding/` | conformance tests, map fixtures                                   | unrelated gameplay systems     |
-| Add editor/SDK feature                    | `crates/ic-editor/`              | `ic-render/`, `ic-sim/`, design docs D038/D040                    | `ic-game` binary integration   |
-| Resolve platform paths                    | `crates/ic-paths/`               | `src/architecture/install-layout.md`                              | everything else                |
-| Add/modify shared wire types              | `crates/ic-protocol/`            | `ic-sim/` + `ic-net/` consumers                                   | — (changes propagate widely)   |
-| Set up game binary / orchestration        | `crates/ic-game/`                | all dependent crates, `src/architecture/game-loop.md`             | —                              |
+| If you need to... | Start here | Then read | Avoid touching first |
+| --- | --- | --- | --- |
+| Add or change shared wire types | `crates/ic-protocol/src/lib.rs` | `crates/ic-protocol/src/tests.rs`, design docs D006/D008/D012 | inventing sim or net behavior locally |
+| Add or change legacy C&C asset loading | `crates/ic-cnc-content/src/lib.rs` | format module `mod.rs` + `tests.rs`, design docs D003/D076 | modifying `cnc-formats` parsing rules in this repo |
+| Add or change owned-source probe contracts | `crates/ic-cnc-content/src/source/mod.rs` | `crates/ic-cnc-content/src/source/tests.rs`, D069, `formats/backup-screenshot-import.md` | jumping straight to platform-specific probing without a normalized snapshot |
+| Learn how Bevy is used here | `crates/ic-cnc-content/src/lib.rs` | format loaders under `crates/ic-cnc-content/src/*/mod.rs`, matching tests | assuming full engine-runtime Bevy patterns already exist |
+| Run the full local validation flow | `ci-local.sh` or `ci-local.ps1` | `.github/workflows/ci.yml`, `.github/workflows/audit.yml`, `deny.toml` | manually running partial checks and assuming parity |
+| Update contributor-facing repo policy | `CONTRIBUTING.md` | `AGENTS.md`, `README.md`, `CODE-INDEX.md` | duplicating canonical design behavior here |
+| Update the project overview / branding | `README.md` | `images/`, `CONTRIBUTING.md`, sibling repo READMEs | describing future local crates as if they already exist |
+| Update implementation policy | `AGENTS.md` | remote design-doc `AGENTS.md`, `src/16-CODING-STANDARDS.md` | encoding one-off session history as permanent policy |
+| Update repo navigation | `CODE-INDEX.md` | current tree under `crates/`, `.github/`, and top-level docs | documenting future crates as if they exist locally |
+| Record a design gap or local verification note | `docs/design-gap-requests/` or `docs/implementation-notes/` | canonical design docs that motivated the note | silently diverging from the design docs |
+| Start a brand-new subsystem from the design docs | `Cargo.toml` workspace + new crate directory | `AGENTS.md`, canonical crate-graph docs, `CODE-INDEX.md` | adding references to nonexistent code paths first |
 
-## Repository Map (Top-Level)
+## Repository Map (Actual Top Level)
 
-| Path                  | Role                                        | Notes                                                                                       |
-| --------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `crates/ic-protocol/` | Shared wire types                           | Boundary crate between sim and net                                                          |
-| `crates/ra-formats/`  | RA1 asset parsers                           | Standalone, no game dependencies                                                            |
-| `crates/ic-paths/`    | Platform path resolution + credential store | Standalone, wraps `app-path` + `strict-path` + `keyring` + `aes-gcm` + `argon2` + `zeroize` |
-| `crates/ic-sim/`      | Deterministic simulation                    | Pure, no I/O, no floats                                                                     |
-| `crates/ic-render/`   | Bevy isometric renderer                     | Reads sim state (read-only)                                                                 |
-| `crates/ic-ui/`       | Game UI chrome (Bevy UI)                    | Reads sim + render state                                                                    |
-| `crates/ic-audio/`    | Sound/music/EVA (Kira)                      | Reads ra-formats for .aud                                                                   |
-| `crates/ic-net/`      | Networking + relay server                   | RelayCore lib + relay binary                                                                |
-| `crates/ic-script/`   | Lua + WASM mod runtimes                     | Sandboxed, capability-gated                                                                 |
-| `crates/ic-ai/`       | Skirmish AI + LLM strategies                | Reads sim state via fog-filtered view; depends on ic-llm                                    |
-| `crates/ic-llm/`      | LLM provider traits + infra                 | No ic-sim import; candle inference runtime (D047)                                           |
-| `crates/ic-editor/`   | SDK editor tools                            | Separate binary from ic-game                                                                |
-| `crates/ic-game/`     | Main game binary                            | Orchestrates all systems                                                                    |
-| `tests/`              | Integration test suites                     | Conformance, replay, determinism                                                            |
-| `assets/`             | Test fixtures and sample maps               | Not shipped — test corpus only                                                              |
-| `docs/`               | Implementation notes                        | Local docs, design-gap requests                                                             |
+| Path | Role | Notes |
+| --- | --- | --- |
+| `AGENTS.md` | Local implementation rules | Must stay aligned with canonical design docs and local workflow requirements |
+| `CODE-INDEX.md` | Navigation index | Describes the repo that exists today, not only the target architecture |
+| `README.md` | Contributor-facing overview | Branding, repo-family context, status, build commands |
+| `CONTRIBUTING.md` | Contribution guide | DCO, local CI, design-doc relationship |
+| `CHANGELOG.md` | Release-history skeleton | Tracks notable repo changes once the project advances |
+| `ci-local.sh` | Unix-like local CI wrapper | Best-effort local wrapper for the main GitHub Actions checks |
+| `ci-local.ps1` | PowerShell local CI wrapper | Windows-friendly best-effort wrapper for the main CI flow |
+| `Cargo.toml` | Workspace manifest | Declares current members and shared dependency policy |
+| `deny.toml` | `cargo-deny` policy | License and dependency source policy for this GPL engine repo |
+| `.github/workflows/ci.yml` | Main CI workflow | Check, fmt, clippy, tests, docs, MSRV, license |
+| `.github/workflows/audit.yml` | Security audit workflow | Scheduled and PR-triggered `cargo audit` |
+| `.github/workflows/dco.yml` | DCO enforcement | Requires `Signed-off-by` on PR commits |
+| `crates/ic-protocol/` | Shared protocol crate | Boundary types used by future sim/net work |
+| `crates/ic-cnc-content/` | Bevy-facing content integration crate | Wraps `cnc-formats` with engine-specific asset loading behavior |
+| `docs/` | Local implementation notes | Currently placeholder directories only |
+| `tests/` | Future integration test home | Currently placeholder only |
+| `assets/` | Future test/sample assets | Currently placeholder only |
+| `images/` | Branding/media assets | Logo, LM-ready, and Rust-inside imagery used by the README |
 
-## Subsystem Index (Canonical Entries)
+## Implemented Subsystems
 
 ### `ic-protocol`
 
 - **Path:** `crates/ic-protocol/`
-- **Primary responsibility:** Shared serializable types that cross the sim/net boundary
-- **Does not own:** game logic, network transport, rendering
-- **Public interfaces / trait seams:** `PlayerOrder`, `TimestampedOrder`, `TickOrders`, `MessageLane`, `FromClient<T>`, `FromServer<T>`
-- **Key files to read first:** `src/lib.rs` (all public types)
-- **Hot paths / perf-sensitive files:** `TimestampedOrder` serialization (wire format, delta compression)
-- **Generated files:** none
-- **Tests / verification entry points:** unit tests for serialization round-trips
+- **Primary responsibility:** shared serializable types at the future sim/net boundary
+- **Owns:** `PlayerId`, `TickNumber`, `SubTickTimestamp`, `PlayerOrder`, `TimestampedOrder`, `TickOrders`, `MessageLane`, `FromClient<T>`, `FromServer<T>`
+- **Does not own:** gameplay logic, networking transport, rendering, file IO
+- **Key files to read first:** `src/lib.rs`, `src/tests.rs`
+- **Tests / verification entry points:** YAML round-trip tests in `src/tests.rs`
+- **Common change risks:** accidental protocol drift, bare integer IDs, adding fields without considering serialization compatibility
 - **Related design decisions (`Dxxx`):** D006, D008, D012
-- **Related execution steps (`G*`):** G6 (sim tick loop), G17 (online netcode)
-- **Common change risks:** changes propagate to both `ic-sim` and `ic-net` — coordinate carefully
-- **Search hints:** `PlayerOrder`, `TimestampedOrder`, `TickOrders`, `MessageLane`
+- **Related execution steps (`G*`):** prepares for later `G6` and `G17`, even though those crates are not local yet
+- **Search hints:** `PlayerOrder`, `TickOrders`, `MessageLane`, `FromClient`, `FromServer`
 
-### `ra-formats`
+### `ic-cnc-content`
 
-- **Path:** `crates/ra-formats/`
-- **Primary responsibility:** Parse RA1 file formats (`.mix`, `.shp`, `.pal`, `.aud`, `.vqa`, MiniYAML)
-- **Does not own:** rendering, audio playback, game logic
-- **Public interfaces / trait seams:** asset loader functions, `MixArchive`, `ShpFrame`, `Palette`, MiniYAML parser
-- **Key files to read first:** `src/lib.rs`, `src/mix.rs`, `src/shp.rs`
-- **Hot paths / perf-sensitive files:** `.mix` archive lookup (used during asset loading)
-- **Generated files:** none
-- **Tests / verification entry points:** format parsing tests against known-good RA1 corpus
+- **Path:** `crates/ic-cnc-content/`
+- **Primary responsibility:** Iron Curtain-side integration for C&C-family content loading
+- **Owns:** Bevy `Plugin`, Bevy `Asset` wrappers, Bevy `AssetLoader`s, IC-specific compatibility decisions such as explicit `.miniyaml` loading
+- **Does not own:** clean-room binary parsing rules, rendering, playback, game logic
+- **Key files to read first:** `src/lib.rs`, then `src/source/mod.rs`, `src/mix/mod.rs`, `src/shp/mod.rs`, `src/pal/mod.rs`, `src/aud/mod.rs`, `src/vqa/mod.rs`, `src/miniyaml/mod.rs`
+- **Tests / verification entry points:** `src/tests.rs`, `src/source/tests.rs`, and each format module's `tests.rs`
+- **Common change risks:** wrapper drift from `cnc-formats`, stale Bevy API assumptions, accidental over-claiming of file extensions, losing educational comments around Bevy concepts, or letting source-probe schemas diverge from D069/D068 expectations
 - **Related design decisions (`Dxxx`):** D003, D023, D025, D027, D075, D076
-- **Related execution steps (`G*`):** G1 (asset parsing)
-- **Common change risks:** format regressions against real RA1 assets; MiniYAML parser compatibility with OpenRA YAML
-- **Search hints:** `mix`, `shp`, `pal`, `aud`, `vqa`, `MiniYAML`, `palette`
+- **Related execution steps (`G*`):** `G1`
+- **Search hints:** `IcCncContentPlugin`, `AssetLoader`, `MixArchive`, `ShpSprite`, `Palette`, `AudAudio`, `VqaVideo`, `MiniYamlAsset`
 
-### `ic-paths`
+## Repo Operations
 
-- **Path:** `crates/ic-paths/`
-- **Primary responsibility:** Platform path resolution — XDG on Linux, APPDATA on Windows, portable mode via `portable.marker`. Wraps `app-path` (exe-relative resolution) and `strict-path` (path boundary enforcement for untrusted inputs). Also owns `CredentialStore` — three-tier credential protection (OS keyring / vault passphrase / session-only) with AES-256-GCM per-column encryption for sensitive SQLite data
-- **Does not own:** file I/O beyond path construction, asset loading
-- **Public interfaces / trait seams:** `AppDirs`, `PathMode::Platform` / `PathMode::Portable`, `AppDirs::save_boundary()` / `mod_boundary()` / `replay_cache_boundary()` (→ `PathBoundary`), `CredentialStore`, `CredentialBackend`
-- **Key files to read first:** `src/lib.rs`, `src/credentials.rs`
-- **Hot paths / perf-sensitive files:** none (called once at startup; credential ops are infrequent)
-- **Generated files:** none
-- **Tests / verification entry points:** unit tests for path resolution on each platform; credential round-trip encryption tests
-- **Related design decisions (`Dxxx`):** D061, D047
-- **Related execution steps (`G*`):** G1 (asset discovery)
-- **Common change risks:** platform-specific path bugs; portable mode detection; OS keyring API differences across Linux DEs
-- **Search hints:** `AppDirs`, `PathMode`, `portable.marker`, `XDG`, `APPDATA`, `CredentialStore`, `CredentialBackend`, `vault_meta`
+### Local CI
 
-### `ic-sim`
+- **Primary entry points:** `ci-local.sh`, `ci-local.ps1`
+- **Alignment target:** `.github/workflows/ci.yml`, with optional local `cargo deny` / `cargo audit` execution when those tools are installed
+- **Common change risks:** letting local scripts drift from GitHub Actions, forgetting `--locked`, or changing MSRV in `Cargo.toml` without updating scripts and workflows
+- **Search hints:** `MSRV`, `cargo deny`, `cargo audit`, `RUSTDOCFLAGS`
 
-- **Path:** `crates/ic-sim/`
-- **Primary responsibility:** Pure deterministic simulation — game state evolution, fixed-point math, ECS world, order application
-- **Does not own:** rendering, networking, audio, UI, file I/O, system clock
-- **Public interfaces / trait seams:** `Simulation`, `SimReadView`, `SimSnapshot`, `DeltaSnapshot`, `GameModule` trait, `FogProvider` trait, `OrderValidator` trait, `AiStrategy` trait, `WorldPos`, `CellPos`, `SimCoord`, `UnitTag`, `Health`, `Mobile`, `Armament`, `Building`, `Selectable`
-- **Key files to read first:** `src/lib.rs` (public API), `src/simulation.rs`, `src/types.rs` (newtypes)
-- **Hot paths / perf-sensitive files:** `src/simulation.rs` (tick loop — runs ~15x/sec at default Slower speed, up to 50x/sec at Fastest), `src/pathfinding/` (hundreds of queries/tick), `src/combat.rs` (weapon fire, hit detection), `src/movement.rs` (unit movement), `src/spatial/` (spatial indexing queries)
-- **Generated files:** none
-- **Tests / verification entry points:** determinism conformance tests (same input → same output across platforms), unit tests per system, replay-based regression tests
-- **Related design decisions (`Dxxx`):** D009, D010, D012, D013, D015, D018, D022, D028, D029, D041, D045
-- **Related execution steps (`G*`):** G6 (tick loop), G7 (pathfinding), G8 (combat), G9 (projectiles), G10 (death/destruction), G11 (victory/failure)
-- **Common change risks:** **determinism regressions** (any non-deterministic operation breaks lockstep for all players), allocations in hot loops, hidden I/O, float usage, HashMap usage
-- **Search hints:** `Simulation`, `apply_tick`, `SimReadView`, `GameModule`, `FogProvider`, `OrderValidator`, `WorldPos`, `SimCoord`, `fixed_point`
+### GitHub Workflows
 
-### `ic-render`
+- **Primary files:** `.github/workflows/ci.yml`, `.github/workflows/audit.yml`, `.github/workflows/dco.yml`
+- **Owns:** automated workspace validation, scheduled security audit, DCO commit-signoff enforcement
+- **Does not own:** release packaging or crate publishing yet
+- **Common change risks:** adding checks locally without CI parity, using unrelated actions, or requiring tools not available on the selected runner
 
-- **Path:** `crates/ic-render/`
-- **Primary responsibility:** Bevy isometric map rendering, sprite animation, camera control, fog-of-war visualization, render mode toggles (D048)
-- **Does not own:** game logic, sim state mutation, audio
-- **Public interfaces / trait seams:** Bevy render systems, camera controller, sprite animation pipeline
-- **Key files to read first:** `src/lib.rs`, `src/map.rs`, `src/sprites.rs`, `src/camera.rs`
-- **Hot paths / perf-sensitive files:** sprite batching, fog rendering, terrain draw calls
-- **Generated files:** none
-- **Tests / verification entry points:** visual regression tests (screenshot comparison), render benchmark
-- **Related design decisions (`Dxxx`):** D002, D003, D048
-- **Related execution steps (`G*`):** G2 (isometric render), G3 (unit animation), G15 (RA "feel" pass)
-- **Common change risks:** Bevy API changes, GPU compatibility, frame budget overruns
-- **Search hints:** `bevy`, `sprite`, `isometric`, `camera`, `fog`, `render_mode`
+## Planned But Not Yet Implemented
 
-### `ic-ui`
+These crates exist in the canonical design docs, not in the local workspace yet:
 
-- **Path:** `crates/ic-ui/`
-- **Primary responsibility:** Game UI chrome — sidebar, power bar, minimap, selection panel, menus, settings. Reads SQLite for player analytics (D034)
-- **Does not own:** sim state mutation, rendering pipeline, audio
-- **Public interfaces / trait seams:** UI systems, `PlayerOrder` emission from UI actions
-- **Key files to read first:** `src/lib.rs`, `src/sidebar.rs`, `src/selection.rs`
-- **Hot paths / perf-sensitive files:** minimap updates, selection rectangle drawing
-- **Generated files:** none
-- **Tests / verification entry points:** UI interaction tests, layout regression tests
-- **Related design decisions (`Dxxx`):** D032, D033, D034, D036, D053, D065
-- **Related execution steps (`G*`):** G4 (cursor/hit-test), G5 (selection), G12 (mission-end UX)
-- **Common change risks:** UX drift from design docs, platform adaptation gaps (desktop vs touch)
-- **Search hints:** `sidebar`, `selection`, `minimap`, `power_bar`, `menu`, `egui`
+| Planned crate | Source of truth today |
+| --- | --- |
+| `ic-sim` | design docs architecture and determinism sections |
+| `ic-render` | design docs render and asset pipeline sections |
+| `ic-ui` | design docs player-flow and UI decisions |
+| `ic-audio` | design docs audio decisions and future integration notes |
+| `ic-net` / `ic-server` | design docs netcode and relay decisions |
+| `ic-script` | design docs modding and sandbox decisions |
+| `ic-ai` | design docs AI decisions |
+| `ic-llm` | design docs LLM decisions |
+| `ic-editor` | design docs editor/SDK decisions |
+| `ic-game` | design docs architecture and game-loop docs |
 
-### `ic-audio`
+When starting one of these crates locally, update:
 
-- **Path:** `crates/ic-audio/`
-- **Primary responsibility:** Sound effects, music jukebox, EVA voice notifications via Kira audio backend
-- **Does not own:** .aud file parsing (that's `ra-formats`), sim logic, rendering
-- **Public interfaces / trait seams:** `CombatAudioEvent`, `EvaNotification`, `MusicStateChange`, jukebox state machine
-- **Key files to read first:** `src/lib.rs`, `src/jukebox.rs`, `src/eva.rs`
-- **Hot paths / perf-sensitive files:** concurrent sound effect mixing (combat scenes with many units)
-- **Generated files:** none
-- **Tests / verification entry points:** audio event trigger tests, jukebox state machine tests
-- **Related design decisions (`Dxxx`):** D003 (P003 resolved: Kira via `bevy_kira_audio`)
-- **Related execution steps (`G*`):** G13 (EVA/VO), G15 (RA "feel" pass)
-- **Common change risks:** audio latency, platform-specific backend issues
-- **Search hints:** `kira`, `eva`, `jukebox`, `CombatAudioEvent`, `MusicStateChange`
+- `Cargo.toml`
+- `README.md`
+- `CONTRIBUTING.md` if contributor workflow changes
+- `AGENTS.md` if boundaries materially change
+- `CODE-INDEX.md`
 
-### `ic-net`
+## Cross-Cutting Boundaries To Preserve
 
-- **Path:** `crates/ic-net/`
-- **Primary responsibility:** `NetworkModel` implementations, `RelayCore` library, `ic-server` binary, timing normalization, delta compression, sub-tick fairness (D008), order rate control (D060)
-- **Does not own:** sim state mutation, order validation logic (that's `ic-sim`), rendering
-- **Public interfaces / trait seams:** `NetworkModel` trait, `RelayCore`, `Connection<S>` (typestate: `Disconnected` → `Handshaking` → `Authenticated` → `InGame` → `PostGame`), `ClientMetrics`, `TimingFeedback`, `OrderBudget`, `AckVector`
-- **Key files to read first:** `src/lib.rs`, `src/relay_core.rs`, `src/network_model.rs`
-- **Hot paths / perf-sensitive files:** order serialization/delta compression (TLV wire format), relay tick broadcast, timing normalization
-- **Generated files:** none
-- **Tests / verification entry points:** relay integration tests, timing fairness tests, delta compression round-trip tests, rate-limit boundary tests
-- **Related design decisions (`Dxxx`):** D006, D007, D008, D011, D052, D055, D060, D072
-- **Related execution steps (`G*`):** G17 (minimal online), G20 (multiplayer productization)
-- **Common change risks:** trust boundary violations (relay must not leak fog-hidden state), fairness drift in timing normalization, timestamp handling mismatches between platforms
-- **Search hints:** `NetworkModel`, `RelayCore`, `Connection`, `TimestampedOrder`, `delta`, `relay`, `lockstep`
+These matter now even if the downstream crates are not implemented yet.
 
-### `ic-script`
+1. `ic-protocol` remains the shared sim/net boundary crate.
+2. `ic-cnc-content` stays an engine integration layer, not the clean-room parser implementation.
+3. Design-doc behavior changes are not settled locally without a design-gap or design-change update.
+4. New code must follow the local documentation rules in `AGENTS.md`: test-first for behavior changes, context-rich docs, documented tests, and an LLM-friendly tree.
+5. Repo-level automation should stay aligned across the Iron Curtain family when the policy is truly shared, but should not blindly copy library-specific release or publish workflows into the engine repo.
 
-- **Path:** `crates/ic-script/`
-- **Primary responsibility:** Lua (`mlua`) and WASM (`wasmtime`) mod runtimes with deterministic sandboxing and capability-based API
-- **Does not own:** sim internals beyond the trait API surface, asset loading
-- **Public interfaces / trait seams:** `ScriptRuntime`, `LuaState`, `WasmInstance`, `WasmSandbox<S>` (typestate: `Loading` → `Ready` → `Executing` → `Terminated`), capability tokens
-- **Key files to read first:** `src/lib.rs`, `src/lua.rs`, `src/wasm.rs`, `src/capabilities.rs`
-- **Hot paths / perf-sensitive files:** Lua function calls per tick (mission scripts), WASM host call boundary
-- **Generated files:** none
-- **Tests / verification entry points:** sandbox escape tests, determinism tests (same script → same output), API surface tests
-- **Related design decisions (`Dxxx`):** D004, D005, D023, D024, D025, D026
-- **Related execution steps (`G*`):** G18 (campaign runtime), G19 (campaign completeness)
-- **Common change risks:** sandbox escape vulnerabilities, determinism regressions in WASM (NaN canonicalization), API surface creep exposing fog-hidden data
-- **Search hints:** `lua`, `wasm`, `mlua`, `wasmtime`, `ScriptRuntime`, `capability`, `sandbox`
+## Generated / Placeholder Areas
 
-### `ic-ai`
+| Path | Current state | Edit policy |
+| --- | --- | --- |
+| `target/` | build output | do not commit; ignore for repo reasoning |
+| `tests/` | placeholder only (`.gitkeep`) | add real integration tests here when they exist |
+| `assets/` | placeholder only (`.gitkeep`) | add fixtures/samples here when they exist |
+| `docs/design-gap-requests/` | placeholder only (`.gitkeep`) | add local design-gap notes here when needed |
+| `docs/implementation-notes/` | placeholder only (`.gitkeep`) | add manual verification or local notes here when needed |
 
-- **Path:** `crates/ic-ai/`
-- **Primary responsibility:** Skirmish AI — `PersonalityDrivenAi`, economy/production/military managers, adaptive difficulty, LLM-enhanced AI strategies (`LlmOrchestratorAi`, `LlmPlayerAi` — D044). Depends on `ic-llm` for provider access. Reads SQLite (D034) for player analytics and personalization
-- **Does not own:** sim state mutation (emits `PlayerOrder` through `AiStrategy` trait), rendering, networking
-- **Public interfaces / trait seams:** `AiStrategy` trait, `PersonalityDrivenAi`, `AiDifficulty` enum, personality config
-- **Key files to read first:** `src/lib.rs`, `src/personality.rs`, `src/strategy.rs`
-- **Hot paths / perf-sensitive files:** `decide()` function — must complete within <0.5ms for 500 units (D043 budget)
-- **Generated files:** none
-- **Tests / verification entry points:** AI decision tests, performance benchmarks, replay-based AI regression tests
-- **Related design decisions (`Dxxx`):** D041, D042, D043, D044, D045
-- **Related execution steps (`G*`):** G16 (basic AI for M3 skirmish), G19 (campaign AI maturity)
-- **Common change risks:** performance budget overruns, fog-filter bypass (AI must use `FogFilteredView`, not raw sim state)
-- **Search hints:** `AiStrategy`, `PersonalityDrivenAi`, `EconomyManager`, `ProductionManager`, `MilitaryManager`
+## Evidence Paths
 
-### `ic-llm`
-
-- **Path:** `crates/ic-llm/`
-- **Primary responsibility:** LLM provider abstraction — four-tier provider system (D047: IC Built-in CPU models, Cloud OAuth, API Key, Local External), `LlmProvider` trait, prompt infrastructure, skill library (D057), pure Rust CPU inference runtime. Does NOT import `ic-sim` or `ic-ai` — traits and infra only. Reads SQLite (D034) for model pack state and provider config.
-- **Does not own:** sim logic, rendering, core gameplay, AI strategies (those live in `ic-ai` which depends on `ic-llm`)
-- **Public interfaces / trait seams:** `LlmProvider` trait, `ProviderTier` enum, `PromptAssembler`, prompt strategy profiles, skill library (D057), pure Rust inference runtime (Tier 1)
-- **Key files to read first:** `src/lib.rs`, `src/provider.rs`, `src/mission_gen.rs`
-- **Hot paths / perf-sensitive files:** none (LLM calls are async, not frame-budget-sensitive)
-- **Generated files:** none
-- **Tests / verification entry points:** prompt template tests, validation pipeline tests, mock provider tests
-- **Related design decisions (`Dxxx`):** D016, D044, D047, D057, D073
-- **Related execution steps (`G*`):** M11 (ecosystem polish, optional AI/LLM)
-- **Common change risks:** provider API changes, prompt injection vulnerabilities, cost overruns from unthrottled LLM calls
-- **Search hints:** `llm`, `provider`, `mission_gen`, `skill_library`, `prompt`, `D016`, `D047`
-
-### `ic-editor`
-
-- **Path:** `crates/ic-editor/`
-- **Primary responsibility:** SDK tools — scenario editor (D038), asset studio (D040), campaign editor. Separate binary from `ic-game`
-- **Does not own:** runtime gameplay, multiplayer, shipping game binary
-- **Public interfaces / trait seams:** editor UI systems, content authoring pipeline
-- **Key files to read first:** `src/lib.rs`, `src/scenario.rs`, `src/asset_studio.rs`
-- **Hot paths / perf-sensitive files:** map rendering in editor (shares `ic-render`)
-- **Generated files:** none
-- **Tests / verification entry points:** editor workflow tests, asset import/export round-trip tests
-- **Related design decisions (`Dxxx`):** D038, D040
-- **Related execution steps (`G*`):** G22 (full SDK editor), M9–M10
-- **Common change risks:** drift from game runtime behavior (editor and game must agree on sim rules)
-- **Search hints:** `editor`, `scenario`, `asset_studio`, `campaign_editor`
-
-### `ic-game`
-
-- **Path:** `crates/ic-game/`
-- **Primary responsibility:** Main game client binary — Bevy app setup, ECS scheduling, system orchestration, ties sim + render + UI + audio + net together
-- **Does not own:** individual subsystem logic (delegates to crate APIs)
-- **Public interfaces / trait seams:** `GameLoop<N, I>` orchestrator, Bevy `App` builder, observer systems for audio/UI events
-- **Key files to read first:** `src/main.rs`, `src/app.rs`, `src/game_loop.rs`
-- **Hot paths / perf-sensitive files:** frame loop (Bevy schedule), sim tick dispatch
-- **Generated files:** none
-- **Tests / verification entry points:** integration tests (full game loop with `LocalNetwork` + `ReplayPlayback`)
-- **Related design decisions (`Dxxx`):** D002, D006 (generic game loop), D054 (async architecture)
-- **Related execution steps (`G*`):** G2+ (progressively integrates all systems)
-- **Common change risks:** system ordering bugs in Bevy schedule, frame budget overruns
-- **Search hints:** `GameLoop`, `bevy::App`, `main`, `schedule`, `observer`
-
-## Cross-Cutting Boundaries (Must Respect)
-
-These rules prevent accidental architecture violations. Breaking them is a blocking code review issue.
-
-1. **`ic-sim` must not import `ic-net`, `ic-render`, `ic-ui`, `ic-audio`, or `ic-editor`** — sim is pure and isolated
-2. **`ic-net` must not import `ic-sim`** — they share only `ic-protocol`
-3. **`ic-game` must not import `ic-editor`** — separate binaries, shared libraries only
-4. **`ic-sim` must not perform I/O** — no file reads, no network calls, no system clock
-5. **`ic-sim` must not use `f32`/`f64`/`HashMap`/`HashSet`** — determinism invariant enforced by CI
-6. **UI must not mutate authoritative sim state** — emit `PlayerOrder`, never write to `Simulation` directly
-7. **Protocol types are the shared boundary** — do not duplicate wire structs across crates
-8. **AI must use `FogFilteredView`** — never access raw sim state (prevents accidental maphack in AI)
-9. **WASM mods use capability-gated API only** — host controls what data mods can see
-
-## Generated / Vendored / Third-Party Areas
-
-| Path                  | Type              | Edit policy                                              |
-| --------------------- | ----------------- | -------------------------------------------------------- |
-| `target/`             | Build output      | Do not commit, gitignored                                |
-| `assets/test-corpus/` | RA1 test fixtures | Replace via test scripts, do not hand-edit binary assets |
-
-## Implementation Evidence Paths
-
-Where to attach proof when claiming progress:
-
-- Unit tests: `cargo test --workspace`
-- Integration tests: `tests/` directory, `cargo test --test <name>`
-- Determinism conformance: `tests/determinism/` (replay-based, cross-platform)
-- Replay/demo artifacts: `tests/fixtures/replays/`
-- Perf profiles/flamegraphs: `benches/`, Tracy/Superluminal captures in `docs/profiles/`
-- Manual verification notes: `docs/implementation-notes/`
-
-## Design Gap Escalation (When Code and Docs Disagree)
-
-If implementation reveals a conflict with canonical design docs:
-
-1. Record the code path and failing assumption
-2. Link the affected `Dxxx` / canonical doc path
-3. Open a design-gap/design-change issue in the design-doc repo
-4. Document the divergence locally in `docs/design-gap-requests/`
-5. Mark local workaround as `implementation placeholder` or `blocked on Pxxx`
+- Workspace build: `cargo build --workspace`
+- Workspace format check: `cargo fmt --all --check`
+- Workspace tests: `cargo test --workspace --locked`
+- Workspace clippy: `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `ic-protocol` proofs: `crates/ic-protocol/src/tests.rs`
+- `ic-cnc-content` proofs: `crates/ic-cnc-content/src/tests.rs`, `crates/ic-cnc-content/src/source/tests.rs`, and `crates/ic-cnc-content/src/*/tests.rs`
+- Local repo automation: `ci-local.sh`, `ci-local.ps1`, and `.github/workflows/*.yml`
 
 ## Maintenance Rules
 
-- Update this file in the same change set when:
-  - code layout changes (new crate, moved files, renamed modules)
-  - ownership boundaries move
-  - new major subsystem is added
-  - active milestone/G* focus changes materially
-- Keep "Task Routing" and "Subsystem Index" current — these are the highest-value sections for agents and new contributors
-- Review this index at each milestone boundary
+- Update this file when crate names, file paths, repo-level workflow files, or ownership boundaries change.
+- Prefer describing current local reality first and future architecture second.
+- Do not list nonexistent files or crates as if they are already present.
+- Keep task routing compact enough that a human or LLM can identify the right file set quickly.
 
 ## Execution Overlay Mapping
 
