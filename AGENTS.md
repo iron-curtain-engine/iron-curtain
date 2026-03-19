@@ -319,9 +319,9 @@ Do **not** open a request for:
 ## Local Repo-Specific Rules
 
 - **Language:** Rust (2021 edition)
-- **Build:** `cargo build --workspace`
-- **Test:** `cargo test --workspace`
-- **Lint:** `cargo clippy --workspace -- -D warnings`
+- **Build:** `cargo build --workspace --locked`
+- **Test:** `cargo test --workspace --locked`
+- **Lint:** `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - **Format:** `cargo fmt --all --check`
 - **CI expectations:** All tests pass, clippy clean (zero warnings), fmt check clean. `clippy::disallowed_types` enforces determinism rules in `ic-sim`
 - **Perf profiling:** `cargo bench` for hot-path microbenchmarks; Tracy/Superluminal for frame profiling
@@ -350,7 +350,7 @@ Do not claim a feature is complete without evidence:
 ## Current Implementation Target (Update Regularly)
 
 - Active milestone: `M1`
-- Active `G*` steps: `G1` (RA asset parsing), `G2` (Bevy isometric render), `G3` (unit animation)
+- Active `G*` steps: `G2` (Bevy window/bootstrap render slice), with `G1` content-pipeline foundations feeding it and `G3` (unit animation) next
 - Current blockers: none known
 - Parallel work lanes allowed: `G1` and `G2` can overlap (parser feeds renderer)
 

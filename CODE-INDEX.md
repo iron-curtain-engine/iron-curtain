@@ -14,11 +14,12 @@
 ## Current Repo State
 
 - Active milestone(s): `M1`
-- Active `G*` step(s): `G1` primary, with `G2` and `G3` planned next
+- Active `G*` step(s): `G2` primary, with completed `G1.1`–`G1.3` feeding it and `G3` planned next
 - Current implemented Rust crates:
   - `crates/ic-protocol`
   - `crates/ic-cnc-content`
   - `crates/ic-render`
+  - `crates/ic-game`
 - Current repo-ops files now maintained locally:
   - `AGENTS.md`
   - `CODE-INDEX.md`
@@ -49,6 +50,7 @@
 | Add or change importer staging for `.mix` archives | `crates/ic-cnc-content/src/mix/mod.rs` | `crates/ic-cnc-content/src/mix/tests.rs`, `05-FORMATS.md`, `execution-ladders.md` `G1.2` | re-implementing archive parsing instead of using `cnc-formats` |
 | Add or change parser-to-render handoff for `.shp` / `.pal` | `crates/ic-cnc-content/src/shp/mod.rs` | `crates/ic-cnc-content/src/shp/tests.rs`, `crates/ic-cnc-content/src/pal/mod.rs`, `crates/ic-cnc-content/src/pal/tests.rs`, `execution-ladders.md` `G1.3` | making the future render crate depend on raw parser internals |
 | Add or change render-side camera math or static-scene validation | `crates/ic-render/src/lib.rs` | `crates/ic-render/src/camera/mod.rs`, `crates/ic-render/src/scene/mod.rs`, matching `tests.rs`, D017, D041, `tracker/checklists.md` `G2` | coupling early render code to missing sim crates or re-parsing format files |
+| Add or change the runnable game-client bootstrap | `crates/ic-game/src/lib.rs` | `crates/ic-game/src/demo.rs`, `crates/ic-game/src/tests.rs`, `crates/ic-render/src/camera/mod.rs`, `crates/ic-render/src/scene/mod.rs` | inventing gameplay or map-loading behavior that the current `G2` slice does not have yet |
 | Learn how Bevy is used here | `crates/ic-cnc-content/src/lib.rs` | format loaders under `crates/ic-cnc-content/src/*/mod.rs`, matching tests | assuming full engine-runtime Bevy patterns already exist |
 | Run the full local validation flow | `ci-local.sh` or `ci-local.ps1` | `.github/workflows/ci.yml`, `.github/workflows/audit.yml`, `deny.toml` | manually running partial checks and assuming parity |
 | Update contributor-facing repo policy | `CONTRIBUTING.md` | `AGENTS.md`, `README.md`, `CODE-INDEX.md` | duplicating canonical design behavior here |
@@ -77,6 +79,7 @@
 | `crates/ic-protocol/` | Shared protocol crate | Boundary types used by future sim/net work |
 | `crates/ic-cnc-content/` | Bevy-facing content integration crate | Wraps `cnc-formats` with engine-specific asset loading behavior |
 | `crates/ic-render/` | Render bootstrap crate | Owns render-side camera resources and static-scene validation for the future viewport |
+| `crates/ic-game/` | Runnable game-client bootstrap crate | Opens the first Bevy window and displays the current RA-style demo sprite |
 | `docs/` | Local implementation notes | Currently placeholder directories only |
 | `tests/` | Future integration test home | Currently placeholder only |
 | `assets/` | Future test/sample assets | Currently placeholder only |
@@ -123,6 +126,19 @@
 - **Related execution steps (`G*`):** `G2`
 - **Search hints:** `IcRenderPlugin`, `GameCamera`, `ClassicIsometricCameraModel`, `ScreenToWorld`, `RenderLayer`, `StaticRenderScene`
 
+### `ic-game`
+
+- **Path:** `crates/ic-game/`
+- **Primary responsibility:** runnable Bevy client bootstrap for the first visible viewport proof
+- **Owns:** window/plugin setup, the synthetic SHP/PAL-backed demo scene, and the startup system that turns current render metadata into one visible sprite
+- **Does not own:** gameplay state, map loading, asset discovery, simulation, UI chrome, or the final palette-aware renderer
+- **Key files to read first:** `src/lib.rs`, then `src/demo.rs`, `src/tests.rs`, `src/main.rs`
+- **Tests / verification entry points:** `src/tests.rs`
+- **Common change risks:** pulling in Bevy platform features that do not match local CI environments, bypassing the `ic-cnc-content`/`ic-render` handoff with ad-hoc image loading, or describing the bootstrap client as a full game loop when it is only a visibility proof
+- **Related design decisions (`Dxxx`):** D017, D041, D076
+- **Related execution steps (`G*`):** `G2`
+- **Search hints:** `run_demo_client`, `BootstrapDemoScene`, `setup_demo_scene`, `Camera2d`, `Sprite::from_image`
+
 ## Repo Operations
 
 ### Local CI
@@ -153,7 +169,6 @@ These crates exist in the canonical design docs, not in the local workspace yet:
 | `ic-ai` | design docs AI decisions |
 | `ic-llm` | design docs LLM decisions |
 | `ic-editor` | design docs editor/SDK decisions |
-| `ic-game` | design docs architecture and game-loop docs |
 
 When starting one of these crates locally, update:
 
@@ -170,9 +185,10 @@ These matter now even if the downstream crates are not implemented yet.
 1. `ic-protocol` remains the shared sim/net boundary crate.
 2. `ic-cnc-content` stays an engine integration layer, not the clean-room parser implementation.
 3. `ic-render` stays render-side: camera/view math and scene descriptors live here, not in `ic-cnc-content` or future sim crates.
-4. Design-doc behavior changes are not settled locally without a design-gap or design-change update.
-5. New code must follow the local documentation rules in `AGENTS.md`: test-first for behavior changes, context-rich docs, documented tests, and an LLM-friendly tree.
-6. Repo-level automation should stay aligned across the Iron Curtain family when the policy is truly shared, but should not blindly copy library-specific release or publish workflows into the engine repo.
+4. `ic-game` is currently a thin executable/bootstrap crate: it should compose the other crates for visible proofs, not absorb their parser or render ownership.
+5. Design-doc behavior changes are not settled locally without a design-gap or design-change update.
+6. New code must follow the local documentation rules in `AGENTS.md`: test-first for behavior changes, context-rich docs, documented tests, and an LLM-friendly tree.
+7. Repo-level automation should stay aligned across the Iron Curtain family when the policy is truly shared, but should not blindly copy library-specific release or publish workflows into the engine repo.
 
 ## Generated / Placeholder Areas
 
@@ -193,6 +209,7 @@ These matter now even if the downstream crates are not implemented yet.
 - `ic-protocol` proofs: `crates/ic-protocol/src/tests.rs`
 - `ic-cnc-content` proofs: `crates/ic-cnc-content/src/tests.rs`, `crates/ic-cnc-content/src/source/tests.rs`, and `crates/ic-cnc-content/src/*/tests.rs`
 - `ic-render` proofs: `crates/ic-render/src/tests.rs`, `crates/ic-render/src/camera/tests.rs`, `crates/ic-render/src/scene/tests.rs`
+- `ic-game` proofs: `crates/ic-game/src/tests.rs`
 - Local repo automation: `ci-local.sh`, `ci-local.ps1`, and `.github/workflows/*.yml`
 
 ## Maintenance Rules

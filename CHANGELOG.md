@@ -18,10 +18,13 @@ restructure APIs and workspace layout aggressively.
 - `G1.2` importer-facing `.mix` staging helpers with duplicate-CRC-safe extraction
 - `G1.3` `.shp` / `.pal` parser-to-render handoff metadata for the future render crate
 - Initial `ic-render` crate with camera bootstrap, classic isometric projection math, and static-scene validation
+- Bootstrap indexed-to-RGBA sprite conversion helpers in `ic-render`
+- Initial `ic-game` crate with a runnable Bevy window and first synthetic RA-style demo sprite
 
 ### Changed
 
 - Renamed the engine-side content crate from `ra-formats` to `ic-cnc-content`
+- Tightened the Bevy feature surface for the runnable client so Linux builds use the local X11 path without requiring Wayland development packages
 
 ### Fixed
 

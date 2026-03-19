@@ -28,10 +28,10 @@ A modern open-source RTS engine in Rust, starting with Command & Conquer.
 Iron Curtain is in early development.
 
 - Active milestone: `M1`
-- Active focus: `G2` render scaffolding on top of completed `G1.1`-`G1.3`
+- Active focus: `G2` windowed render bootstrap on top of completed `G1.1`-`G1.3`
   content-pipeline foundations
-- Current workspace crates: `ic-protocol`, `ic-cnc-content`, `ic-render`
-- No playable build exists yet
+- Current workspace crates: `ic-protocol`, `ic-cnc-content`, `ic-render`, `ic-game`
+- A runnable bootstrap client exists, but no playable game build exists yet
 
 ## Design And Local Rules
 
@@ -84,6 +84,18 @@ GitHub Actions is the authoritative enforcement path for documentation, MSRV,
 license, and security-audit checks; the local scripts run those checks when the
 required tools are available on the machine.
 
+## First Visible Slice
+
+The repo now includes a narrow runnable client bootstrap:
+
+```bash
+cargo run -p ic-game --locked
+```
+
+Today this opens a Bevy window and draws one synthetic RA-style sprite built
+through the current `ic-cnc-content` and `ic-render` pipeline. It is a proof of
+the content-to-render handoff, not a full map loader or gameplay loop yet.
+
 ## Current Crates
 
 | Crate | Purpose |
@@ -91,6 +103,7 @@ required tools are available on the machine.
 | `ic-protocol` | Shared wire types for the future simulation/network boundary |
 | `ic-cnc-content` | Iron Curtain-side Bevy integration for legacy C&C content loading |
 | `ic-render` | Render-side camera bootstrap and static-scene validation for the future RA viewport |
+| `ic-game` | Runnable Bevy client bootstrap that opens a window and displays the first RA-style demo sprite |
 
 Additional crates from the full architecture will be added as local
 implementation reaches later milestones.

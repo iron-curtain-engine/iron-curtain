@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025–present Iron Curtain contributors
+
+[package]
+name = "ic-game"
+version = "0.1.0"
+description = "Iron Curtain bootstrap game client"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+bevy = { version = "0.18.1", default-features = false, features = [
+    "default_app",
+    "bevy_core_pipeline",
+    "bevy_image",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_winit",
+    "multi_threaded",
+    "png",
+    "std",
+    "x11",
+] }
+ic-cnc-content = { path = "../ic-cnc-content" }
+ic-render = { path = "../ic-render" }
+thiserror = "2.0.18"

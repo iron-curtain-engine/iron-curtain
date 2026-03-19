@@ -12,6 +12,7 @@ use bevy::app::{App, Plugin};
 
 pub mod camera;
 pub mod scene;
+pub mod sprite;
 
 /// Registers the render-side resources that later gameplay/editor code will use.
 ///
