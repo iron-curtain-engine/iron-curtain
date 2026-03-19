@@ -38,6 +38,58 @@ pub struct MixEntry {
     pub size: u32,
 }
 
+/// Importer-facing metadata for one physical `.mix` entry.
+///
+/// This differs from simple filename lookup in one important way: it preserves
+/// the physical archive index. That makes duplicate-CRC entries extractable in
+/// a stable way, which matters for provenance records and retryable import
+/// operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixStagedEntry {
+    /// Physical position inside the archive's SubBlock table.
+    pub archive_index: usize,
+    /// Westwood CRC identifier used for lookup on disk.
+    pub crc: cnc_mix::MixCrc,
+    /// Optional human-readable filename recovered from embedded name metadata.
+    pub logical_name: Option<String>,
+    /// Payload byte offset relative to the archive body.
+    pub offset: u32,
+    /// Payload size in bytes.
+    pub size: u32,
+}
+
+/// Extracted payload plus the metadata that explains where it came from.
+///
+/// The importer writes IC-managed storage using this shape so later stages can
+/// preserve both the bytes and the archive-level provenance for each file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixStagedFile {
+    /// Directory metadata for the extracted entry.
+    pub entry: MixStagedEntry,
+    /// Exact source payload bytes copied from the archive body.
+    pub bytes: Vec<u8>,
+}
+
+/// Errors specific to importer staging on top of a parsed `.mix` archive.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MixStagingError {
+    #[error("MIX parse error: {0}")]
+    Parse(#[from] cnc_formats::Error),
+    #[error("archive index {archive_index} is out of range for MIX with {entry_count} entries")]
+    EntryOutOfRange {
+        archive_index: usize,
+        entry_count: usize,
+    },
+    #[error(
+        "archive entry {archive_index} could not be sliced after validation (offset {offset}, size {size})"
+    )]
+    EntryPayloadUnavailable {
+        archive_index: usize,
+        offset: u32,
+        size: u32,
+    },
+}
+
 /// Engine asset wrapper around a parsed Westwood `.mix` archive.
 ///
 /// The wrapper snapshots directory information into owned Rust types for easy
@@ -51,6 +103,20 @@ pub struct MixArchive {
 }
 
 impl MixArchive {
+    fn staged_entry_from_parser(
+        embedded_names: &BTreeMap<cnc_mix::MixCrc, String>,
+        archive_index: usize,
+        entry: &cnc_mix::MixEntry,
+    ) -> MixStagedEntry {
+        MixStagedEntry {
+            archive_index,
+            crc: entry.crc,
+            logical_name: embedded_names.get(&entry.crc).cloned(),
+            offset: entry.offset,
+            size: entry.size,
+        }
+    }
+
     /// Parses raw `.mix` bytes and caches the directory metadata needed by IC.
     ///
     /// The wrapper eagerly snapshots entry metadata into owned Rust values so
@@ -117,6 +183,88 @@ impl MixArchive {
     /// layers do not need to rediscover this Westwood-specific detail.
     pub fn embedded_names(&self) -> &BTreeMap<cnc_mix::MixCrc, String> {
         &self.embedded_names
+    }
+
+    /// Builds importer-facing metadata for every physical archive entry.
+    ///
+    /// This is the primary `G1.2` enumeration surface. It reopens the
+    /// clean-room parser view so staging always reflects the parser-validated
+    /// archive state instead of trusting stale cached assumptions.
+    pub fn staged_entries(&self) -> Result<Vec<MixStagedEntry>, cnc_formats::Error> {
+        let archive = self.archive()?;
+        Ok(archive
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(archive_index, entry)| {
+                Self::staged_entry_from_parser(&self.embedded_names, archive_index, entry)
+            })
+            .collect())
+    }
+
+    /// Extracts one physical archive entry for importer staging.
+    ///
+    /// The archive index is used intentionally instead of filename lookup so
+    /// duplicate CRC entries remain individually addressable. The returned
+    /// bytes are an owned copy: staging code can persist them to IC-managed
+    /// storage without mutating or borrowing from the original source archive.
+    pub fn extract_entry_for_staging(
+        &self,
+        archive_index: usize,
+    ) -> Result<MixStagedFile, MixStagingError> {
+        let archive = self.archive()?;
+        let entry =
+            archive
+                .entries()
+                .get(archive_index)
+                .ok_or(MixStagingError::EntryOutOfRange {
+                    archive_index,
+                    entry_count: archive.entries().len(),
+                })?;
+        let bytes = archive.get_by_index(archive_index).ok_or(
+            MixStagingError::EntryPayloadUnavailable {
+                archive_index,
+                offset: entry.offset,
+                size: entry.size,
+            },
+        )?;
+
+        Ok(MixStagedFile {
+            entry: Self::staged_entry_from_parser(&self.embedded_names, archive_index, entry),
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Extracts every physical archive entry into importer-owned buffers.
+    ///
+    /// This is the simplest archive-to-storage handoff for early importer
+    /// staging. Later pipeline steps can filter or route these staged files,
+    /// but they no longer need to know MIX-specific CRC lookup rules.
+    pub fn extract_all_for_staging(&self) -> Result<Vec<MixStagedFile>, MixStagingError> {
+        let archive = self.archive()?;
+        archive
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(archive_index, entry)| {
+                let bytes = archive.get_by_index(archive_index).ok_or(
+                    MixStagingError::EntryPayloadUnavailable {
+                        archive_index,
+                        offset: entry.offset,
+                        size: entry.size,
+                    },
+                )?;
+
+                Ok(MixStagedFile {
+                    entry: Self::staged_entry_from_parser(
+                        &self.embedded_names,
+                        archive_index,
+                        entry,
+                    ),
+                    bytes: bytes.to_vec(),
+                })
+            })
+            .collect()
     }
 
     /// Looks up and copies a payload by filename using `cnc-formats` rules.

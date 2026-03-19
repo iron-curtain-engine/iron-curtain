@@ -45,6 +45,8 @@
 | Add or change shared wire types | `crates/ic-protocol/src/lib.rs` | `crates/ic-protocol/src/tests.rs`, design docs D006/D008/D012 | inventing sim or net behavior locally |
 | Add or change legacy C&C asset loading | `crates/ic-cnc-content/src/lib.rs` | format module `mod.rs` + `tests.rs`, design docs D003/D076 | modifying `cnc-formats` parsing rules in this repo |
 | Add or change owned-source probe contracts | `crates/ic-cnc-content/src/source/mod.rs` | `crates/ic-cnc-content/src/source/tests.rs`, D069, `formats/backup-screenshot-import.md` | jumping straight to platform-specific probing without a normalized snapshot |
+| Add or change importer staging for `.mix` archives | `crates/ic-cnc-content/src/mix/mod.rs` | `crates/ic-cnc-content/src/mix/tests.rs`, `05-FORMATS.md`, `execution-ladders.md` `G1.2` | re-implementing archive parsing instead of using `cnc-formats` |
+| Add or change parser-to-render handoff for `.shp` / `.pal` | `crates/ic-cnc-content/src/shp/mod.rs` | `crates/ic-cnc-content/src/shp/tests.rs`, `crates/ic-cnc-content/src/pal/mod.rs`, `crates/ic-cnc-content/src/pal/tests.rs`, `execution-ladders.md` `G1.3` | making the future render crate depend on raw parser internals |
 | Learn how Bevy is used here | `crates/ic-cnc-content/src/lib.rs` | format loaders under `crates/ic-cnc-content/src/*/mod.rs`, matching tests | assuming full engine-runtime Bevy patterns already exist |
 | Run the full local validation flow | `ci-local.sh` or `ci-local.ps1` | `.github/workflows/ci.yml`, `.github/workflows/audit.yml`, `deny.toml` | manually running partial checks and assuming parity |
 | Update contributor-facing repo policy | `CONTRIBUTING.md` | `AGENTS.md`, `README.md`, `CODE-INDEX.md` | duplicating canonical design behavior here |
@@ -96,11 +98,11 @@
 
 - **Path:** `crates/ic-cnc-content/`
 - **Primary responsibility:** Iron Curtain-side integration for C&C-family content loading
-- **Owns:** Bevy `Plugin`, Bevy `Asset` wrappers, Bevy `AssetLoader`s, IC-specific compatibility decisions such as explicit `.miniyaml` loading
+- **Owns:** Bevy `Plugin`, Bevy `Asset` wrappers, Bevy `AssetLoader`s, importer-facing `.mix` staging helpers, parser-to-render handoff metadata for `.shp` / `.pal`, IC-specific compatibility decisions such as explicit `.miniyaml` loading
 - **Does not own:** clean-room binary parsing rules, rendering, playback, game logic
 - **Key files to read first:** `src/lib.rs`, then `src/source/mod.rs`, `src/mix/mod.rs`, `src/shp/mod.rs`, `src/pal/mod.rs`, `src/aud/mod.rs`, `src/vqa/mod.rs`, `src/miniyaml/mod.rs`
 - **Tests / verification entry points:** `src/tests.rs`, `src/source/tests.rs`, and each format module's `tests.rs`
-- **Common change risks:** wrapper drift from `cnc-formats`, stale Bevy API assumptions, accidental over-claiming of file extensions, losing educational comments around Bevy concepts, or letting source-probe schemas diverge from D069/D068 expectations
+- **Common change risks:** wrapper drift from `cnc-formats`, stale Bevy API assumptions, accidental over-claiming of file extensions, losing educational comments around Bevy concepts, letting source-probe schemas diverge from D069/D068 expectations, or making later importer/render crates rediscover format metadata instead of using the explicit handoff surfaces
 - **Related design decisions (`Dxxx`):** D003, D023, D025, D027, D075, D076
 - **Related execution steps (`G*`):** `G1`
 - **Search hints:** `IcCncContentPlugin`, `AssetLoader`, `MixArchive`, `ShpSprite`, `Palette`, `AudAudio`, `VqaVideo`, `MiniYamlAsset`

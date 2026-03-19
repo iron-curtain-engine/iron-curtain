@@ -28,3 +28,17 @@ fn palette_parses_into_color_table() {
     // instead of forcing callers to interpret the file format themselves.
     assert_eq!(palette.to_rgb8_array()[0], [0, 0, 0]);
 }
+
+/// Proves that the palette wrapper exposes explicit import/render handoff
+/// metadata instead of making later crates infer palette shape by convention.
+#[test]
+fn palette_reports_render_handoff_metadata() {
+    let bytes = vec![0u8; cnc_pal::PALETTE_BYTES];
+    let palette = Palette::parse(bytes).expect("valid PAL should parse");
+    let handoff = palette.render_handoff();
+
+    assert_eq!(handoff.color_count, cnc_pal::PALETTE_SIZE);
+    assert_eq!(handoff.source_bytes, cnc_pal::PALETTE_BYTES);
+    assert_eq!(handoff.colors[0], [0, 0, 0]);
+    assert_eq!(handoff.colors[255], [0, 0, 0]);
+}

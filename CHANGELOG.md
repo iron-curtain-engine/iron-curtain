@@ -15,6 +15,8 @@ restructure APIs and workspace layout aggressively.
 - Human/LLM navigation index in `CODE-INDEX.md`
 - Local CI scripts and expanded GitHub Actions coverage
 - `G1.1` source probe contract and source-manifest snapshot schema in `ic-cnc-content`
+- `G1.2` importer-facing `.mix` staging helpers with duplicate-CRC-safe extraction
+- `G1.3` `.shp` / `.pal` parser-to-render handoff metadata for the future render crate
 
 ### Changed
 

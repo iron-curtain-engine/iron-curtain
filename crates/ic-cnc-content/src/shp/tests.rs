@@ -35,3 +35,27 @@ fn shp_sprite_parses_header_and_decodes_frames() {
         vec![pixels.to_vec()]
     );
 }
+
+/// Proves that the wrapper exposes an explicit render-handoff summary for the
+/// future render crate.
+///
+/// `G1.3` is the bridge from parsing to rendering: the render crate should be
+/// able to ask for dimensions, frame counts, and embedded-palette presence
+/// without depending on the raw SHP header layout.
+#[test]
+fn shp_sprite_reports_render_handoff_metadata() {
+    let frame_a = [1u8, 2, 3, 4];
+    let frame_b = [5u8, 6, 7, 8];
+    let bytes = cnc_shp::encode_frames(&[frame_a.as_slice(), frame_b.as_slice()], 2, 2)
+        .expect("test SHP should encode");
+    let shp = ShpSprite::parse(bytes).expect("encoded SHP should parse");
+    let handoff = shp.render_handoff();
+
+    assert_eq!(handoff.width, 2);
+    assert_eq!(handoff.height, 2);
+    assert_eq!(handoff.frame_count, 2);
+    assert!(!handoff.has_embedded_palette);
+    assert_eq!(handoff.frames.len(), 2);
+    assert_eq!(handoff.frames[0].frame_index, 0);
+    assert_eq!(handoff.frames[0], shp.frames[0]);
+}

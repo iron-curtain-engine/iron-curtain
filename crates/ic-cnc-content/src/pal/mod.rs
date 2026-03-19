@@ -30,6 +30,21 @@ pub struct Palette {
     inner: cnc_pal::Palette,
 }
 
+/// Explicit renderer/importer handoff for a validated Westwood palette.
+///
+/// The render crate should not need to know that classic palettes are stored
+/// as 768 bytes of 6-bit VGA color data. This handoff exposes the normalized
+/// 8-bit RGB table plus the validation facts that importer diagnostics may log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteRenderHandoff {
+    /// Number of usable palette entries in the expanded color table.
+    pub color_count: usize,
+    /// Original source payload size that was validated during parse.
+    pub source_bytes: usize,
+    /// Renderer-friendly 8-bit RGB color table.
+    pub colors: [[u8; 3]; cnc_pal::PALETTE_SIZE],
+}
+
 impl Palette {
     /// Parses raw palette bytes into the engine-facing wrapper.
     ///
@@ -56,6 +71,19 @@ impl Palette {
     /// direct 256-entry RGB table instead of parser-specific palette internals.
     pub fn to_rgb8_array(&self) -> [[u8; 3]; cnc_pal::PALETTE_SIZE] {
         self.inner.to_rgb8_array()
+    }
+
+    /// Returns the normalized palette summary used by importer/render handoff.
+    ///
+    /// `G1.3` needs an explicit bridge from `.pal` validation into the later
+    /// render crate. This keeps palette-size assumptions and RGB expansion in
+    /// one place instead of duplicating them across future systems.
+    pub fn render_handoff(&self) -> PaletteRenderHandoff {
+        PaletteRenderHandoff {
+            color_count: cnc_pal::PALETTE_SIZE,
+            source_bytes: cnc_pal::PALETTE_BYTES,
+            colors: self.to_rgb8_array(),
+        }
     }
 }
 
