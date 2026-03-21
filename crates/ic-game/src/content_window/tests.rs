@@ -1102,6 +1102,94 @@ fn streaming_first_frame_phase_uses_timer_and_auto_plays() {
     }
 }
 
+/// Proves that `finalize_streaming` preserves the video position and Timer
+/// mode when audio arrives, so the video does not visibly restart.
+///
+/// A/V sync is achieved by the caller rotating the audio sample buffer to
+/// match the video's current position (see `rotate_audio_to_video_position`)
+/// rather than resetting the video to frame 0.
+///
+/// Regression: resetting to frame 0 on audio arrival caused the movie to
+/// visibly restart after a few hundred milliseconds of streaming playback.
+#[test]
+fn finalize_streaming_with_audio_preserves_position_and_timer() {
+    use super::preview::{
+        AudioInfo, ContentPreviewTracker, PlaybackSyncMode,
+        VisualPreviewSession,
+    };
+    use super::catalog::ContentFamily;
+
+    let mut tracker = ContentPreviewTracker::default();
+
+    // Simulate: Loading → StreamingFirstFrame with video advanced to frame 3.
+    tracker.test_begin_loading(ContentFamily::Video);
+    let frames: Vec<_> = (0..10)
+        .map(|i| {
+            ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![i, i, i, 255])
+                .expect("frame should be valid")
+        })
+        .collect();
+    let session =
+        VisualPreviewSession::new(frames, Some(1.0 / 15.0)).expect("session should be created");
+    tracker.test_begin_streaming(session);
+    // Advance video as if timer-based playback ran for a bit.
+    tracker.test_select_frame(3);
+    assert_eq!(tracker.test_current_frame_index(), 3);
+
+    // Finalize with audio — must keep Timer and preserve position.
+    tracker.test_finalize_streaming(Some(AudioInfo {
+        duration_seconds: 5.0,
+    }));
+    assert_eq!(
+        tracker.test_sync_mode(),
+        PlaybackSyncMode::Timer,
+        "finalize_streaming must keep Timer mode so the video never restarts",
+    );
+    assert_eq!(
+        tracker.test_current_frame_index(),
+        3,
+        "finalize_streaming must preserve the video position",
+    );
+    assert!(
+        tracker.test_playback_requested(),
+        "playback should remain requested after finalize",
+    );
+}
+
+/// Proves that `finalize_streaming` without audio keeps Timer mode and
+/// preserves the current frame position.
+#[test]
+fn finalize_streaming_without_audio_keeps_timer() {
+    use super::preview::{ContentPreviewTracker, PlaybackSyncMode, VisualPreviewSession};
+    use super::catalog::ContentFamily;
+
+    let mut tracker = ContentPreviewTracker::default();
+    tracker.test_begin_loading(ContentFamily::Video);
+    let frames: Vec<_> = (0..5)
+        .map(|i| {
+            ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![i, i, i, 255])
+                .expect("frame should be valid")
+        })
+        .collect();
+    let session =
+        VisualPreviewSession::new(frames, Some(1.0 / 15.0)).expect("session should be created");
+    tracker.test_begin_streaming(session);
+    tracker.test_select_frame(2);
+
+    // Finalize without audio — should keep Timer and preserve position.
+    tracker.test_finalize_streaming(None);
+    assert_eq!(
+        tracker.test_sync_mode(),
+        PlaybackSyncMode::Timer,
+        "finalize_streaming without audio must stay Timer",
+    );
+    assert_eq!(
+        tracker.test_current_frame_index(),
+        2,
+        "finalize_streaming without audio must preserve frame position",
+    );
+}
+
 /// Proves that the waveform preview generator does not panic on `i16::MIN`,
 /// the extreme-but-valid PCM sample value.
 ///

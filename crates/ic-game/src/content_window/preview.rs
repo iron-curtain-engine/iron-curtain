@@ -411,8 +411,11 @@ impl ContentPreviewTracker {
 
     /// Transition: StreamingFirstFrame → Ready.
     ///
-    /// Preserves the current frame position and timer so playback
-    /// continues without a visible skip.
+    /// Preserves the current frame position, timer, and Timer sync mode so
+    /// playback continues without a visible skip.  The caller is responsible
+    /// for aligning the audio start position with the video's current frame
+    /// before spawning the audio entity (see `rotate_audio_to_video_position`
+    /// in `poll_content_preview_load`).
     fn finalize_streaming(
         &mut self,
         audio_info: Option<AudioInfo>,
@@ -425,8 +428,6 @@ impl ContentPreviewTracker {
                 frame_timer_seconds,
                 playback_requested,
             } => {
-                // Streaming always used Timer; keep it even after audio
-                // arrives to avoid jumping back to frame 0.
                 self.phase = PreviewPhase::Ready {
                     family,
                     visual_session,
@@ -755,6 +756,44 @@ impl ContentPreviewTracker {
     }
 }
 
+// ── Test-only accessors ──────────────────────────────────────────────
+//
+// The tracker's phase-transition and query methods are intentionally
+// private so production code must go through the well-defined system
+// functions.  Tests need direct access to drive the state machine and
+// assert on internal state.
+
+#[cfg(test)]
+impl ContentPreviewTracker {
+    pub(crate) fn test_begin_loading(&mut self, family: ContentFamily) {
+        self.begin_loading(family);
+    }
+
+    pub(crate) fn test_begin_streaming(&mut self, session: VisualPreviewSession) {
+        self.begin_streaming(session);
+    }
+
+    pub(crate) fn test_finalize_streaming(&mut self, audio_info: Option<AudioInfo>) {
+        self.finalize_streaming(audio_info);
+    }
+
+    pub(crate) fn test_select_frame(&mut self, index: usize) {
+        self.select_frame(index);
+    }
+
+    pub(crate) fn test_current_frame_index(&self) -> usize {
+        self.current_frame_index()
+    }
+
+    pub(crate) fn test_sync_mode(&self) -> PlaybackSyncMode {
+        self.sync_mode()
+    }
+
+    pub(crate) fn test_playback_requested(&self) -> bool {
+        self.playback_requested()
+    }
+}
+
 /// Marker component for the one audio-preview entity.
 #[derive(Component)]
 pub(crate) struct ContentPreviewAudio;
@@ -799,6 +838,9 @@ pub(crate) fn refresh_content_preview(
     mut state: ResMut<ContentLabState>,
     mut tracker: ResMut<ContentPreviewTracker>,
     archive_cache: Res<super::ArchivePreloadCache>,
+    #[cfg(target_os = "windows")]
+    existing_audio_entities: Query<(Entity, Option<&AudioSink>), With<ContentPreviewAudio>>,
+    #[cfg(not(target_os = "windows"))]
     existing_audio_entities: Query<Entity, With<ContentPreviewAudio>>,
 ) {
     let selection = state.selected_location();
@@ -806,6 +848,20 @@ pub(crate) fn refresh_content_preview(
         return;
     }
 
+    // Pause then despawn old audio entities.  `sink.pause()` takes effect
+    // immediately, while `commands.entity().despawn()` is deferred until the
+    // end of the frame.  Without the explicit pause, the old movie's audio
+    // continues to play through the OS audio buffer for the remainder of the
+    // frame — audible as a brief burst of stale audio when switching movies
+    // quickly.
+    #[cfg(target_os = "windows")]
+    for (entity, sink) in &existing_audio_entities {
+        if let Some(sink) = sink {
+            sink.pause();
+        }
+        commands.entity(entity).despawn();
+    }
+    #[cfg(not(target_os = "windows"))]
     for entity in &existing_audio_entities {
         commands.entity(entity).despawn();
     }
@@ -882,13 +938,19 @@ pub(crate) fn refresh_content_preview(
     }
 }
 
-/// Applies background preview-preparation messages as they arrive.
+/// Drains all pending background preview-preparation messages in a single frame.
 ///
-/// Video resources send two messages: a lightweight `FirstFrame` as soon as the
-/// opening frame is decoded (typically within milliseconds of the file read),
-/// followed by a `Full` result once all remaining frames and audio are ready.
-/// Non-video resources send only `Full`.  The task resource is removed once the
-/// final message has been consumed.
+/// Video resources send a lightweight `FirstFrame` as soon as the opening frame
+/// is decoded, then N `VqaStream` frame batches, then one final `VqaStream`
+/// with `done: true` carrying the audio payload.  Non-video resources send only
+/// `Full`.  The task resource is removed once the final message has been
+/// consumed.
+///
+/// **Why drain instead of one-per-frame?**  The background decode thread can
+/// outpace the 60 fps main loop, buffering many messages in the channel.  With
+/// a single `try_recv()` per frame the done-batch (carrying audio) would not
+/// arrive until N+2 frames later, producing an A/V delay proportional to the
+/// number of batches (i.e. the movie length).  Draining eliminates that delay.
 pub(crate) fn poll_content_preview_load(
     mut commands: Commands,
     task: Option<Res<ContentPreviewLoadTask>>,
@@ -911,145 +973,177 @@ pub(crate) fn poll_content_preview_load(
         return;
     };
 
-    match receiver.try_recv() {
-        Ok(PreviewLoadMessage::FirstFrame {
-            selection,
-            entry: _,
-            preview,
-        }) => {
-            if tracker.current_selection != Some(selection) {
-                return;
+    // Drain every pending message in a single frame.  The background
+    // decode thread sends one FirstFrame, then N VqaStream frame-batch
+    // messages, then one VqaStream{done} with audio.  With a single
+    // try_recv() per frame, the done-batch (carrying the audio payload)
+    // would not be processed until N+2 frames later — during which the
+    // video plays silently via timer.  For long cutscenes with many
+    // batches, that delay grows proportionally and becomes audible as an
+    // A/V desync that worsens with movie length.  Draining the channel
+    // ensures the audio entity is created on the same frame all frames
+    // arrive, keeping the delay to at most one frame regardless of batch
+    // count.
+    loop {
+        match receiver.try_recv() {
+            Ok(PreviewLoadMessage::FirstFrame {
+                selection,
+                entry: _,
+                preview,
+            }) => {
+                if tracker.current_selection != Some(selection) {
+                    continue;
+                }
+                // Build the visual session from the first frame and seed the
+                // display image, but do NOT call apply_ready — we use
+                // begin_streaming to enter the StreamingFirstFrame phase.
+                if let Ok(Some(preview)) = &preview {
+                    if let Some(visual) = preview.visual().cloned() {
+                        if let Some(session) = VisualPreviewSession::new(
+                            visual.frames().to_vec(),
+                            visual.frame_duration_seconds(),
+                        ) {
+                            let initial_frame = session.current_frame();
+                            tracker.display_image_handle =
+                                Some(images.add(rgba_frame_to_image(initial_frame)));
+                            tracker.begin_streaming(session);
+                        }
+                    }
+                    state.set_preview_summary(preview.summary_text());
+                }
             }
-            // Build the visual session from the first frame and seed the
-            // display image, but do NOT call apply_ready — we use
-            // begin_streaming to enter the StreamingFirstFrame phase.
-            if let Ok(Some(preview)) = &preview {
-                if let Some(visual) = preview.visual().cloned() {
-                    if let Some(session) = VisualPreviewSession::new(
-                        visual.frames().to_vec(),
-                        visual.frame_duration_seconds(),
-                    ) {
-                        let initial_frame = session.current_frame();
-                        tracker.display_image_handle =
-                            Some(images.add(rgba_frame_to_image(initial_frame)));
-                        tracker.begin_streaming(session);
+            Ok(PreviewLoadMessage::Full {
+                selection,
+                entry,
+                preview,
+            }) => {
+                if tracker.current_selection != Some(selection) {
+                    commands.remove_resource::<ContentPreviewLoadTask>();
+                    break;
+                }
+
+                // If a first-frame session already exists, upgrade it in place so
+                // the display surface stays stable.  Otherwise apply from scratch.
+                let result = if tracker.visual_session().is_some() {
+                    upgrade_preview_with_full_decode(
+                        &entry,
+                        preview,
+                        &mut commands,
+                        #[cfg(target_os = "windows")]
+                        &mut audio_sources,
+                        &mut tracker,
+                    )
+                } else {
+                    apply_prepared_preview(
+                        &entry,
+                        preview,
+                        &mut commands,
+                        &mut images,
+                        #[cfg(target_os = "windows")]
+                        &mut audio_sources,
+                        &mut tracker,
+                    )
+                };
+
+                match result {
+                    Ok(Some(preview)) => {
+                        state.set_preview_summary(preview.summary_text());
+                        #[cfg(target_os = "windows")]
+                        state.set_playback_summary(tracker.runtime_status(None));
+                        #[cfg(not(target_os = "windows"))]
+                        state.set_playback_summary(tracker.runtime_status());
+                    }
+                    Ok(None) => {
+                        state.set_preview_summary(format!(
+                            "No preview surface for {} yet.\nThis entry is cataloged, but the content lab does not decode it yet.",
+                            entry.family
+                        ));
+                        state.set_playback_summary("No active preview runtime.");
+                    }
+                    Err(error) => {
+                        state.set_preview_summary(format!(
+                            "Preview load failed for {}:\n{error}",
+                            entry.relative_path
+                        ));
+                        state.set_playback_summary(
+                            "Runtime unavailable because preview decode failed.",
+                        );
                     }
                 }
-                state.set_preview_summary(preview.summary_text());
-            }
-        }
-        Ok(PreviewLoadMessage::Full {
-            selection,
-            entry,
-            preview,
-        }) => {
-            if tracker.current_selection != Some(selection) {
+
                 commands.remove_resource::<ContentPreviewLoadTask>();
-                return;
+                break;
             }
-
-            // If a first-frame session already exists, upgrade it in place so
-            // the display surface stays stable.  Otherwise apply from scratch.
-            let result = if tracker.visual_session().is_some() {
-                upgrade_preview_with_full_decode(
-                    &entry,
-                    preview,
-                    &mut commands,
-                    #[cfg(target_os = "windows")]
-                    &mut audio_sources,
-                    &mut tracker,
-                )
-            } else {
-                apply_prepared_preview(
-                    &entry,
-                    preview,
-                    &mut commands,
-                    &mut images,
-                    #[cfg(target_os = "windows")]
-                    &mut audio_sources,
-                    &mut tracker,
-                )
-            };
-
-            match result {
-                Ok(Some(preview)) => {
-                    state.set_preview_summary(preview.summary_text());
-                    #[cfg(target_os = "windows")]
-                    state.set_playback_summary(tracker.runtime_status(None));
-                    #[cfg(not(target_os = "windows"))]
-                    state.set_playback_summary(tracker.runtime_status());
+            Ok(PreviewLoadMessage::VqaStream { selection, batch }) => {
+                if tracker.current_selection != Some(selection) {
+                    continue;
                 }
-                Ok(None) => {
-                    state.set_preview_summary(format!(
-                        "No preview surface for {} yet.\nThis entry is cataloged, but the content lab does not decode it yet.",
-                        entry.family
-                    ));
-                    state.set_playback_summary("No active preview runtime.");
+
+                // Append streamed frames to the existing visual session.
+                if !batch.frames.is_empty() {
+                    tracker.push_streaming_frames(batch.frames);
                 }
-                Err(error) => {
-                    state.set_preview_summary(format!(
-                        "Preview load failed for {}:\n{error}",
-                        entry.relative_path
-                    ));
-                    state.set_playback_summary(
-                        "Runtime unavailable because preview decode failed.",
-                    );
-                }
-            }
 
-            commands.remove_resource::<ContentPreviewLoadTask>();
-        }
-        Ok(PreviewLoadMessage::VqaStream { selection, batch }) => {
-            if tracker.current_selection != Some(selection) {
-                return;
-            }
-
-            // Append streamed frames to the existing visual session.
-            if !batch.frames.is_empty() {
-                tracker.push_streaming_frames(batch.frames);
-            }
-
-            // When the final batch arrives, transition to Ready.
-            if batch.done {
-                let total_samples = batch.audio_samples.len();
-                let audio_info = if total_samples > 0 {
-                    if let (Some(sample_rate), Some(channels)) =
-                        (batch.audio_sample_rate, batch.audio_channels)
-                    {
-                        #[cfg(target_os = "windows")]
+                // When the final batch arrives, transition to Ready.
+                if batch.done {
+                    let total_samples = batch.audio_samples.len();
+                    let audio_info = if total_samples > 0 {
+                        if let (Some(sample_rate), Some(channels)) =
+                            (batch.audio_sample_rate, batch.audio_channels)
                         {
-                            let pcm = PcmAudioSource::new(
-                                Arc::from(batch.audio_samples),
-                                sample_rate,
-                                channels,
-                            );
-                            tracker.audio_handle = Some(audio_sources.add(pcm));
-                            respawn_preview_audio_entity(&mut commands, &mut tracker);
-                        }
-                        let duration_seconds = if sample_rate > 0 && channels > 0 {
-                            total_samples as f32 / (sample_rate as f32 * channels as f32)
+                            #[cfg(target_os = "windows")]
+                            {
+                                // Rotate the audio buffer so it starts at the
+                                // same point in the movie as the video.  During
+                                // streaming the video has been playing via timer,
+                                // so it is ahead of second 0.  Without rotation
+                                // the audio would start from the beginning while
+                                // the video is already at frame N, producing an
+                                // audible A/V desync.  Because the audio loops,
+                                // the rotated buffer wraps seamlessly: both
+                                // audio and video have the same total period and
+                                // the same phase within that period.
+                                let samples = rotate_audio_to_video_position(
+                                    batch.audio_samples,
+                                    sample_rate,
+                                    channels,
+                                    &tracker,
+                                );
+                                let pcm = PcmAudioSource::new(
+                                    Arc::from(samples),
+                                    sample_rate,
+                                    channels,
+                                );
+                                tracker.audio_handle = Some(audio_sources.add(pcm));
+                                respawn_preview_audio_entity(&mut commands, &mut tracker);
+                            }
+                            let duration_seconds = if sample_rate > 0 && channels > 0 {
+                                total_samples as f32 / (sample_rate as f32 * channels as f32)
+                            } else {
+                                0.0
+                            };
+                            Some(AudioInfo { duration_seconds })
                         } else {
-                            0.0
-                        };
-                        Some(AudioInfo { duration_seconds })
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-                tracker.finalize_streaming(audio_info);
-                commands.remove_resource::<ContentPreviewLoadTask>();
+                    };
+                    tracker.finalize_streaming(audio_info);
+                    commands.remove_resource::<ContentPreviewLoadTask>();
+                    break;
+                }
             }
-        }
-        Err(mpsc::TryRecvError::Empty) => {}
-        Err(mpsc::TryRecvError::Disconnected) => {
-            tracker.phase = PreviewPhase::Empty;
-            state.set_preview_summary(
-                "Background preview preparation failed because the worker thread disconnected.",
-            );
-            state.set_playback_summary("Runtime unavailable because preview preparation failed.");
-            commands.remove_resource::<ContentPreviewLoadTask>();
+            Err(mpsc::TryRecvError::Empty) => { break; }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tracker.phase = PreviewPhase::Empty;
+                state.set_preview_summary(
+                    "Background preview preparation failed because the worker thread disconnected.",
+                );
+                state.set_playback_summary("Runtime unavailable because preview preparation failed.");
+                commands.remove_resource::<ContentPreviewLoadTask>();
+                break;
+            }
         }
     }
 }
@@ -1149,12 +1243,27 @@ pub(crate) fn handle_content_preview_input(
 /// The sink may not exist on the exact frame the preview entity is spawned, so
 /// this system is intentionally idempotent: it re-applies the desired
 /// play/pause state every update until the sink catches up.
+///
+/// **Important:** We look up the sink by `tracker.audio_entity` rather than
+/// using a broad `Query<&AudioSink, With<ContentPreviewAudio>>`.  When the
+/// user switches movies quickly, a despawn command for the old movie's audio
+/// entity is queued but not yet flushed (Bevy commands are deferred).  A broad
+/// query would still find the old entity's sink and erroneously un-pause it,
+/// causing the previous movie's audio to play under the new movie's video.
+/// Targeting by entity avoids this zombie-sink race entirely.
 #[cfg(target_os = "windows")]
 pub(crate) fn sync_content_preview_audio_state(
     tracker: Res<ContentPreviewTracker>,
     audio_sink_query: Query<&AudioSink, With<ContentPreviewAudio>>,
 ) {
-    let Ok(sink) = audio_sink_query.single() else {
+    // Only operate on the sink that the tracker currently owns.  If the
+    // tracker has no audio_entity (e.g. during a selection transition or for
+    // non-audio content), we must not touch any sinks — they are zombies
+    // awaiting deferred despawn.
+    let Some(entity) = tracker.audio_entity else {
+        return;
+    };
+    let Ok(sink) = audio_sink_query.get(entity) else {
         return;
     };
 
@@ -1191,13 +1300,20 @@ pub(crate) fn advance_content_preview_animation(
     let frame_count = tracker.frame_count();
     let current = tracker.current_frame_index();
 
+    // When audio-syncing, derive the frame index from the audio sink's
+    // playback position.  We look up the sink by tracker.audio_entity rather
+    // than a broad query to avoid reading the position of a zombie sink that
+    // belongs to a previously-selected movie (still alive because Bevy
+    // commands are deferred).
     let next_frame = if tracker.has_audio() && tracker.sync_mode() == PlaybackSyncMode::AudioSync {
-        audio_sink_query.single().ok().map(|sink| {
-            let fc = frame_count.max(1);
-            let cycle_seconds = frame_duration * fc as f32;
-            let position = sink.position().as_secs_f32();
-            ((position % cycle_seconds) / frame_duration).floor() as usize % fc
-        })
+        tracker.audio_entity
+            .and_then(|entity| audio_sink_query.get(entity).ok())
+            .map(|sink| {
+                let fc = frame_count.max(1);
+                let cycle_seconds = frame_duration * fc as f32;
+                let position = sink.position().as_secs_f32();
+                ((position % cycle_seconds) / frame_duration).floor() as usize % fc
+            })
     } else {
         let Some(timer) = tracker.frame_timer_seconds_mut() else {
             return;
@@ -1263,7 +1379,10 @@ pub(crate) fn refresh_content_preview_status(
     mut state: ResMut<ContentLabState>,
     audio_sink_query: Query<&AudioSink, With<ContentPreviewAudio>>,
 ) {
-    let audio_sink = audio_sink_query.single().ok();
+    // Target by tracker.audio_entity to avoid reading a zombie sink that
+    // belongs to a previously-selected movie awaiting deferred despawn.
+    let audio_sink = tracker.audio_entity
+        .and_then(|entity| audio_sink_query.get(entity).ok());
     state.set_playback_summary(tracker.runtime_status(audio_sink));
 }
 
@@ -1516,6 +1635,49 @@ fn start_content_preview_load(
     ContentPreviewLoadTask {
         receiver: Mutex::new(receiver),
     }
+}
+
+/// Rotates the raw PCM sample buffer so audio playback begins at the same
+/// point in the movie as the video's current frame.
+///
+/// During streaming, the video plays via a local timer and may be several
+/// hundred milliseconds ahead of second 0 by the time the full audio decode
+/// finishes.  Starting audio from sample 0 would leave it audibly behind.
+///
+/// This function calculates the video's elapsed time from the current frame
+/// index and frame duration, converts that to a sample offset, and rotates
+/// the buffer so that the corresponding audio starts first.  Because the
+/// audio loops, the rotation is seamless: the total duration is unchanged
+/// and both audio and video wrap at the same period with the same phase.
+#[cfg(target_os = "windows")]
+fn rotate_audio_to_video_position(
+    mut samples: Vec<i16>,
+    sample_rate: u32,
+    channels: u16,
+    tracker: &ContentPreviewTracker,
+) -> Vec<i16> {
+    let frame_index = tracker.current_frame_index();
+    let frame_duration = tracker.frame_duration_seconds().unwrap_or(0.0);
+
+    if frame_index == 0 || frame_duration <= 0.0 || samples.is_empty() {
+        return samples;
+    }
+
+    let video_elapsed = frame_index as f32 * frame_duration;
+    let samples_per_second = sample_rate as f32 * channels as f32;
+    let skip_samples = (video_elapsed * samples_per_second).round() as usize;
+
+    // Align to a whole frame (channels) boundary to avoid swapping L/R.
+    let ch = channels.max(1) as usize;
+    let skip_aligned = (skip_samples / ch) * ch;
+
+    if skip_aligned == 0 || skip_aligned >= samples.len() {
+        return samples;
+    }
+
+    // In-place rotation — no extra allocation.
+    samples.rotate_left(skip_aligned);
+    samples
 }
 
 #[cfg(target_os = "windows")]
