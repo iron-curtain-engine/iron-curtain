@@ -13,6 +13,7 @@
 //! Bevy-facing runtime code focused on presentation and playback state rather
 //! than mixing UI concerns with binary decoding rules.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -44,6 +45,10 @@ const TEXT_PREVIEW_MAX_LINES: usize = 18;
 const TEXT_PREVIEW_MAX_CHARS: usize = 1_600;
 const TMP_PREVIEW_MAX_TILES: usize = 16;
 const TMP_PREVIEW_COLUMNS: usize = 4;
+
+thread_local! {
+    static THREAD_LOCAL_CACHE: RefCell<Option<super::ArchivePreloadCache>> = const { RefCell::new(None) };
+}
 
 /// Static preview surfaces the content lab can offer for one catalog entry.
 ///
@@ -242,8 +247,13 @@ impl AudioPreview {
 pub(crate) fn load_preview_for_entry(
     entry: &ContentCatalogEntry,
     catalogs: &[ContentCatalog],
+    cache: Option<&super::ArchivePreloadCache>,
 ) -> Result<Option<PreparedContentPreview>, PreviewLoadError> {
-    match entry_extension_lower(entry).as_deref() {
+    // Stash the cache in a thread-local so every load_entry_bytes() call in
+    // the individual loaders can transparently benefit from preloaded archives
+    // without threading the parameter through every function signature.
+    THREAD_LOCAL_CACHE.with_borrow_mut(|tl| *tl = cache.cloned());
+    let result = match entry_extension_lower(entry).as_deref() {
         Some("shp") => Ok(Some(load_shp_preview(entry, catalogs)?)),
         Some("pal") => Ok(Some(load_palette_preview(entry)?)),
         Some("aud") => Ok(Some(load_aud_preview(entry)?)),
@@ -262,7 +272,9 @@ pub(crate) fn load_preview_for_entry(
             ContentFamily::Config | ContentFamily::Document => Ok(Some(load_text_preview(entry)?)),
             _ => Ok(None),
         },
-    }
+    };
+    THREAD_LOCAL_CACHE.with_borrow_mut(|tl| *tl = None);
+    result
 }
 
 /// Returns the validation surfaces the content lab knows how to expose for an
@@ -349,6 +361,20 @@ pub(crate) fn resolve_palette_entry_for_visual<'a>(
 }
 
 pub(crate) fn load_entry_bytes(entry: &ContentCatalogEntry) -> Result<Vec<u8>, PreviewLoadError> {
+    THREAD_LOCAL_CACHE.with_borrow(|tl| {
+        load_entry_bytes_cached(entry, tl.as_ref())
+    })
+}
+
+/// Loads entry bytes, optionally using a preloaded in-memory archive cache.
+///
+/// When the cache contains the archive for an archive member, the entry is
+/// extracted from the cached buffer (a fast in-memory operation) instead of
+/// reopening the file on disk.
+pub(crate) fn load_entry_bytes_cached(
+    entry: &ContentCatalogEntry,
+    cache: Option<&super::ArchivePreloadCache>,
+) -> Result<Vec<u8>, PreviewLoadError> {
     match &entry.location {
         ContentEntryLocation::Filesystem { absolute_path } => Ok(fs::read(absolute_path)?),
         ContentEntryLocation::MixMember {
@@ -356,16 +382,54 @@ pub(crate) fn load_entry_bytes(entry: &ContentCatalogEntry) -> Result<Vec<u8>, P
             archive_index,
             ..
         } => {
-            let archive = ic_cnc_content::mix::MixArchive::parse(fs::read(archive_path)?)?;
-            Ok(archive.extract_entry_for_staging(*archive_index)?.bytes)
+            use ic_cnc_content::cnc_formats::mix::MixArchiveReader;
+            let cached_bytes = cache
+                .and_then(|c| c.archives.lock().ok())
+                .and_then(|map| map.get(archive_path).cloned());
+            if let Some(bytes) = cached_bytes {
+                eprintln!("[cache] HIT mix {} ({}B in RAM)", entry.relative_path, bytes.len());
+                let cursor = std::io::Cursor::new(bytes.as_ref());
+                let mut reader = MixArchiveReader::open(cursor)?;
+                return reader
+                    .read_by_index(*archive_index)?
+                    .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                        entry_path: entry.relative_path.clone(),
+                    });
+            }
+            eprintln!("[cache] MISS mix {} (reading from disk)", entry.relative_path);
+            let file = fs::File::open(archive_path)?;
+            let mut reader = MixArchiveReader::open(std::io::BufReader::new(file))?;
+            reader
+                .read_by_index(*archive_index)?
+                .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                    entry_path: entry.relative_path.clone(),
+                })
         }
         ContentEntryLocation::MegMember {
             archive_path,
             archive_index,
             ..
         } => {
-            let archive = ic_cnc_content::meg::MegArchive::parse(fs::read(archive_path)?)?;
-            Ok(archive.extract_entry_for_staging(*archive_index)?.bytes)
+            use ic_cnc_content::cnc_formats::meg::MegArchiveReader;
+            let cached_bytes = cache
+                .and_then(|c| c.archives.lock().ok())
+                .and_then(|map| map.get(archive_path).cloned());
+            if let Some(bytes) = cached_bytes {
+                let cursor = std::io::Cursor::new(bytes.as_ref());
+                let mut reader = MegArchiveReader::open(cursor)?;
+                return reader
+                    .read_by_index(*archive_index)?
+                    .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                        entry_path: entry.relative_path.clone(),
+                    });
+            }
+            let file = fs::File::open(archive_path)?;
+            let mut reader = MegArchiveReader::open(std::io::BufReader::new(file))?;
+            reader
+                .read_by_index(*archive_index)?
+                .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                    entry_path: entry.relative_path.clone(),
+                })
         }
     }
 }
@@ -595,7 +659,13 @@ fn load_vqa_preview(
                 vqa.header.height as u32,
                 &frame.pixels,
                 &frame.palette,
-                true,
+                // VQA movie frames are full-screen raster images, not sprite
+                // sheets. Palette index 0 is therefore a real color entry, not
+                // an implicit transparent background like many SHP/TMP-style
+                // art assets. Treating it as transparent produces the exact
+                // failure mode the user saw: mostly dark screen, sparse visible
+                // fragments, and correct audio.
+                false,
             )
         })
         .collect::<Result<Vec<_>, SpriteBootstrapError>>()?;
@@ -1061,7 +1131,7 @@ fn waveform_frame(
         let end = ((x + 1).saturating_mul(samples.len()) / (width as usize).max(1)).max(start + 1);
         let mut peak = 0i32;
         for &sample in samples.get(start..end).unwrap_or(&[]) {
-            peak = peak.max(sample.abs() as i32);
+            peak = peak.max((sample as i32).abs());
         }
 
         let amplitude = ((peak as f32 / i16::MAX as f32) * (height as f32 * 0.45)) as i32;
@@ -1097,7 +1167,7 @@ fn draw_waveform_column(
     }
 }
 
-fn rgba_frame_from_palette_indices(
+pub(crate) fn rgba_frame_from_palette_indices(
     width: u32,
     height: u32,
     pixels: &[u8],
@@ -1129,6 +1199,71 @@ fn audio_duration_seconds(sample_count: usize, sample_rate: u32, channels: u16) 
         return 0.0;
     }
     (sample_count as f32) / (sample_rate as f32 * channels as f32)
+}
+
+/// Loads only the first frame of a VQA video for instant display.
+///
+/// Uses the incremental `VqaDecoder` from cnc-formats ≥ 0.1.0-alpha.2 to
+/// decode a single frame without materializing the entire movie.  The result
+/// is a partial preview with one visual frame and no audio — the full decode
+/// runs on a background thread and replaces this initial preview once it
+/// finishes.
+#[allow(dead_code)]
+pub(crate) fn load_vqa_first_frame_preview(
+    entry: &ContentCatalogEntry,
+) -> Result<Option<PreparedContentPreview>, PreviewLoadError> {
+    let bytes = load_entry_bytes(entry)?;
+    let first = match super::vqa_stream::decode_vqa_first_frame(&bytes)? {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    Ok(Some(build_first_frame_preview(entry, first)?))
+}
+
+/// Builds a first-frame preview from an already-decoded first frame.
+///
+/// Separated from [`load_vqa_first_frame_preview`] so the streaming path can
+/// reuse it without re-reading the file.
+pub(crate) fn build_first_frame_preview(
+    entry: &ContentCatalogEntry,
+    first: super::vqa_stream::FirstVqaFrame,
+) -> Result<PreparedContentPreview, PreviewLoadError> {
+    let rgba = rgba_frame_from_palette_indices(
+        first.width as u32,
+        first.height as u32,
+        &first.frame.pixels,
+        &first.frame.palette,
+        false,
+    )?;
+
+    let fps = first.fps;
+    let has_audio = first.has_audio;
+
+    Ok(PreparedContentPreview {
+        label: format!("VQA preview (streaming): {}", entry.relative_path),
+        details: vec![
+            format!(
+                "frames: {} at {}x{} pixels | fps: {}",
+                first.num_frames, first.width, first.height, fps
+            ),
+            format!(
+                "audio: {}",
+                if has_audio {
+                    "decoding in background"
+                } else {
+                    "none"
+                }
+            ),
+            "First frame displayed instantly; remaining frames loading in background...".into(),
+            preview_control_hint(true, has_audio),
+        ],
+        visual: Some(VisualPreview {
+            frames: vec![rgba],
+            frame_duration_seconds: Some(1.0 / (fps as f32)),
+        }),
+        audio: None,
+        text_body: None,
+    })
 }
 
 fn preview_control_hint(has_animation: bool, has_audio: bool) -> String {

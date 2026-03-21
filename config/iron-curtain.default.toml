@@ -1,0 +1,81 @@
+# Iron Curtain — default configuration
+#
+# This file contains the built-in defaults and documents every setting.
+# Do NOT put machine-specific paths here — this file is checked into git.
+#
+# To override values, copy this file to `iron-curtain.toml` (same directory)
+# and edit to taste. The game loads `iron-curtain.toml` first; if absent,
+# it falls back to this file.
+
+# ─── Display ────────────────────────────────────────────────────────────────
+
+[display]
+# Window title shown in the title bar / taskbar.
+title = "Iron Curtain - Content Lab"
+
+# Window mode: "borderless-fullscreen", "windowed", "fullscreen".
+mode = "borderless-fullscreen"
+
+# Fallback resolution used before the window system applies fullscreen.
+# Only matters in "windowed" mode or if the fullscreen switch is delayed.
+width = 1280
+height = 720
+
+# Background clear colour (sRGB 0–255).
+clear_color = [15, 20, 24]
+
+# ─── Content sources ────────────────────────────────────────────────────────
+#
+# Each [[sources]] entry adds one content root to the lab.
+# Fields:
+#   name          — human-readable label shown in the UI
+#   path          — absolute filesystem path (forward slashes work on Windows)
+#   kind          — "steam", "gog", "ea-app", "openra", "manual"
+#   rights        — "owned-proprietary", "open-content", "local-custom"
+#   shape         — "directory" (default) or "single-file"
+#
+# Environment variables in `path` are expanded at load time:
+#   "${IC_RA1_DISC_ROOT}" resolves to the value of IC_RA1_DISC_ROOT.
+#
+# No sources are configured by default. Add your own in iron-curtain.toml.
+# Examples:
+#
+# [[sources]]
+# name = "RA1 Allied Disc"
+# path = "/path/to/your/CD1_ALLIED_DISC"
+# kind = "manual"
+# rights = "owned-proprietary"
+# shape = "directory"
+#
+# [[sources]]
+# name = "C&C Remastered Collection"
+# path = "C:/Program Files (x86)/Steam/steamapps/common/CnCRemastered"
+# kind = "steam"
+# rights = "owned-proprietary"
+# shape = "directory"
+
+# ─── Performance ────────────────────────────────────────────────────────────
+
+[performance]
+# Load entire MIX/MEG archives into RAM at startup for faster browsing.
+# Trades memory for speed — good for machines with plenty of RAM.
+preload_archives = false
+
+# ─── Playback ───────────────────────────────────────────────────────────────
+
+[playback]
+# Default animation FPS for sprites and WSA sequences without an explicit rate.
+default_animation_fps = 12.0
+
+# Maximum fraction of the window the preview surface can occupy.
+# Videos get larger fractions for a cinematic feel.
+preview_max_width  = 0.72
+preview_max_height = 0.72
+movie_max_width    = 0.96
+movie_max_height   = 0.96
+
+# ─── Audio ──────────────────────────────────────────────────────────────────
+
+[audio]
+# Master volume (0.0 = mute, 1.0 = full).
+master_volume = 1.0

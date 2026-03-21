@@ -197,6 +197,28 @@ fn content_window_text_reports_selected_source_and_entry() {
     assert!(text.contains("Preview:"));
 }
 
+/// Proves that the content lab can start in a loading state without already
+/// having finished catalog construction.
+///
+/// The runtime uses this mode so the Bevy window appears immediately while a
+/// background worker scans large Red Alert / Remastered trees.
+#[test]
+fn loading_state_reports_configured_sources_before_scan_completion() {
+    let state = ContentLabState::loading(vec![ContentSourceRoot::directory(
+        "Fixture CD",
+        PathBuf::from("/example/ra"),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    )]);
+
+    let text = state.render_text();
+
+    assert!(state.is_loading());
+    assert!(text.contains("Scanning configured source roots"));
+    assert!(text.contains("Fixture CD"));
+    assert!(text.contains("/example/ra"));
+}
+
 /// Proves that the content-lab window uses a desktop-safe fallback size before
 /// Bevy's fullscreen mode claims the monitor.
 ///
@@ -204,7 +226,8 @@ fn content_window_text_reports_selected_source_and_entry() {
 /// briefly construct the window before the fullscreen request is honored.
 #[test]
 fn content_window_starts_in_borderless_fullscreen_mode() {
-    let window = content_lab_window();
+    let display = crate::config::DisplayConfig::default();
+    let window = content_lab_window(&display);
 
     assert_eq!(window.title, "Iron Curtain - Content Lab");
     assert_eq!(window.resolution.physical_width(), 1280);
@@ -214,6 +237,42 @@ fn content_window_starts_in_borderless_fullscreen_mode() {
         WindowMode::BorderlessFullscreen(MonitorSelection::Primary)
     );
     assert!(!window.resizable);
+}
+
+/// Proves that video resources claim a larger contain-fit presentation budget
+/// than ordinary art assets.
+///
+/// The content lab treats cutscenes as a "movie mode" surface. They should
+/// use almost the whole monitor while still preserving aspect ratio, whereas
+/// sprites and palettes should leave room for the surrounding diagnostics UI.
+#[test]
+fn video_preview_surface_policy_uses_movie_mode_budget() {
+    let playback = crate::config::PlaybackConfig::default();
+    let video_policy =
+        super::preview::preview_surface_policy_for_family(Some(ContentFamily::Video), &playback);
+    let sprite_policy =
+        super::preview::preview_surface_policy_for_family(Some(ContentFamily::SpriteSheet), &playback);
+
+    assert!(video_policy.max_width_fraction > sprite_policy.max_width_fraction);
+    assert!(video_policy.max_height_fraction > sprite_policy.max_height_fraction);
+    assert_eq!(video_policy.max_width_fraction, 0.96);
+    assert_eq!(video_policy.max_height_fraction, 0.96);
+}
+
+/// Proves that preview preparation is pushed to a background task for real
+/// video playback instead of blocking the Bevy update thread.
+///
+/// `cnc-formats` currently exposes whole-file VQA decode, so the best local
+/// runtime policy is to move that work off the main thread while keeping the
+/// UI responsive. Static art still stays on the simpler immediate path.
+#[test]
+fn video_preview_policy_uses_background_loading() {
+    assert!(super::preview::should_background_load_preview_for_family(
+        ContentFamily::Video
+    ));
+    assert!(!super::preview::should_background_load_preview_for_family(
+        ContentFamily::SpriteSheet
+    ));
 }
 
 /// Proves that the fullscreen content lab does not exit on a single accidental
@@ -269,6 +328,65 @@ fn content_lab_prefers_the_first_previewable_entry_on_startup() {
             .expect("the previewable entry should exist")
             .relative_path,
         "CONQUER_OUTPUT/1TNK.SHP"
+    );
+}
+
+/// Proves that startup prefers a recognizable showcase asset like `TANYA1.VQA`
+/// when one is present instead of dropping the user onto an arbitrary first
+/// sprite in sorted path order.
+///
+/// The content lab is supposed to make it obvious that it is reading real Red
+/// Alert data. Landing on a famous movie clip is a stronger proof surface than
+/// defaulting to the alphabetically earliest unit sprite.
+#[test]
+fn content_lab_prefers_showcase_assets_when_available() {
+    let fixture = TestDir::new("content_window_showcase_selection");
+    fixture.write_file("CONQUER_OUTPUT/1TNK.SHP", b"shp");
+    fixture.write_file("MOVIES/TANYA1.VQA", b"vqa");
+
+    let source = ContentSourceRoot::directory(
+        "Fixture CD",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let state = ContentLabState::new(vec![ContentCatalog::scan(source)]);
+
+    assert_eq!(state.selected_catalog_index(), 0);
+    assert_eq!(
+        state
+            .selected_entry()
+            .expect("the showcase entry should be selected")
+            .relative_path,
+        "MOVIES/TANYA1.VQA"
+    );
+}
+
+/// Proves that once a background scan completes, replacing the placeholder
+/// state with real catalogs lands on the expected showcase resource.
+#[test]
+fn replacing_loading_state_with_catalogs_selects_showcase_resource() {
+    let fixture = TestDir::new("content_window_replace_catalogs");
+    fixture.write_file("CONQUER_OUTPUT/1TNK.SHP", b"shp");
+    fixture.write_file("MOVIES/TANYA1.VQA", b"vqa");
+
+    let source = ContentSourceRoot::directory(
+        "Fixture CD",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let mut state = ContentLabState::loading(vec![source.clone()]);
+
+    state.replace_catalogs(vec![ContentCatalog::scan(source)]);
+
+    assert!(!state.is_loading());
+    assert_eq!(
+        state
+            .selected_entry()
+            .expect("the showcase entry should be selected after loading")
+            .relative_path,
+        "MOVIES/TANYA1.VQA"
     );
 }
 
@@ -361,6 +479,124 @@ fn contained_image_size_preserves_aspect_ratio_for_tall_assets() {
 
     assert_eq!(contained.width, 50.0);
     assert_eq!(contained.height, 150.0);
+}
+
+/// Proves that animated preview runtime state uses one display surface even
+/// when multiple decoded frames are cached behind it.
+///
+/// This is the local stepping stone toward a true streaming movie player. The
+/// content lab still eagerly decodes some media today, but the Bevy runtime
+/// should no longer mirror that by creating one GPU image per frame.
+#[test]
+fn visual_preview_session_uses_one_display_surface_for_multi_frame_media() {
+    let frame_a =
+        ic_render::sprite::RgbaSpriteFrame::from_rgba(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255])
+            .expect("frame A should be valid");
+    let frame_b =
+        ic_render::sprite::RgbaSpriteFrame::from_rgba(2, 1, vec![0, 0, 255, 255, 255, 255, 0, 255])
+            .expect("frame B should be valid");
+
+    let session = super::preview::VisualPreviewSession::new(vec![frame_a, frame_b], Some(0.1))
+        .expect("a multi-frame session should be created");
+
+    assert_eq!(session.frame_count(), 2);
+    assert_eq!(session.display_surface_count(), 1);
+    assert_eq!(session.current_frame_index(), 0);
+    assert!(session.runtime_summary().contains("cached frames: 2"));
+    assert!(session.runtime_summary().contains("display surface: 1"));
+}
+
+/// Proves that switching frames in the visual session changes only the active
+/// frame pointer instead of discarding the prepared cache.
+///
+/// The future streaming path will replace the eager frame cache with a bounded
+/// queue, but the selection semantics should stay the same: advance the active
+/// frame while keeping the runtime surface stable.
+#[test]
+fn visual_preview_session_switches_active_frame_without_rebuilding_the_session() {
+    let frame_a = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![10, 20, 30, 255])
+        .expect("frame A should be valid");
+    let frame_b = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![40, 50, 60, 255])
+        .expect("frame B should be valid");
+
+    let mut session = super::preview::VisualPreviewSession::new(vec![frame_a, frame_b], Some(0.2))
+        .expect("a two-frame session should be created");
+
+    session.select_frame(1);
+
+    assert_eq!(session.frame_count(), 2);
+    assert_eq!(session.current_frame_index(), 1);
+    assert_eq!(
+        session.current_frame().rgba8_pixels(),
+        &[40, 50, 60, 255],
+        "switching the active frame should expose the second cached frame",
+    );
+}
+
+/// Proves that advancing an animation frame inside the current preview runtime
+/// reuses the same Bevy image allocation when the frame size stays stable.
+///
+/// The content lab already moved to one persistent display surface for the
+/// selected preview. Reusing the pixel buffer for equal-sized frames prevents
+/// an avoidable allocation on every frame step while we wait for upstream
+/// incremental decode APIs.
+#[test]
+fn image_update_reuses_pixel_buffer_for_same_sized_preview_frames() {
+    let frame_a =
+        ic_render::sprite::RgbaSpriteFrame::from_rgba(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255])
+            .expect("frame A should be valid");
+    let frame_b =
+        ic_render::sprite::RgbaSpriteFrame::from_rgba(2, 1, vec![0, 0, 255, 255, 255, 255, 0, 255])
+            .expect("frame B should be valid");
+    let mut image = super::preview::rgba_frame_to_image(&frame_a);
+    let pointer_before = image
+        .data
+        .as_ref()
+        .expect("the preview image should keep CPU-visible pixel data")
+        .as_ptr();
+
+    super::preview::update_image_from_rgba_frame(&mut image, &frame_b);
+
+    let data = image
+        .data
+        .as_ref()
+        .expect("the preview image should still expose pixel data after update");
+    assert_eq!(
+        pointer_before,
+        data.as_ptr(),
+        "equal-sized frame updates should reuse the same image buffer allocation",
+    );
+    assert_eq!(data.as_slice(), frame_b.rgba8_pixels());
+}
+
+/// Proves that the display surface updates its descriptor when a new frame has
+/// different dimensions.
+///
+/// This matters for defensive correctness in the current local runtime and for
+/// future streaming playback, where the presentation surface must reflect the
+/// latest decoded frame metadata instead of assuming the original dimensions
+/// forever.
+#[test]
+fn image_update_rewrites_descriptor_when_frame_dimensions_change() {
+    let frame_a = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![10, 20, 30, 255])
+        .expect("frame A should be valid");
+    let frame_b =
+        ic_render::sprite::RgbaSpriteFrame::from_rgba(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255])
+            .expect("frame B should be valid");
+    let mut image = super::preview::rgba_frame_to_image(&frame_a);
+
+    super::preview::update_image_from_rgba_frame(&mut image, &frame_b);
+
+    assert_eq!(image.texture_descriptor.size.width, 2);
+    assert_eq!(image.texture_descriptor.size.height, 1);
+    assert_eq!(
+        image
+            .data
+            .as_ref()
+            .expect("the resized preview image should still expose pixel data")
+            .as_slice(),
+        frame_b.rgba8_pixels(),
+    );
 }
 
 /// Proves that classic SHP previews prefer `TEMPERAT.PAL` over other available
@@ -674,6 +910,14 @@ fn vqa_preview_surfaces_video_frames_and_audio() {
     assert_eq!(preview.frame().height(), 2);
     assert_eq!(preview.frame_count(), Some(2));
     assert!(preview.audio_pcm_samples().is_some());
+    assert!(
+        preview
+            .frame()
+            .rgba8_pixels()
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 255),
+        "VQA movie frames should stay fully opaque; palette index 0 is a real video color, not transparency",
+    );
     assert!(preview.summary_text().contains("Actual VQA preview"));
     assert!(preview.summary_text().contains("audio: present"));
 }

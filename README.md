@@ -104,10 +104,23 @@ wrapper so humans and agents only need one repo command name to remember.
 Use `lint` first to get the current platform green before paying for the test
 run, then use `all` for the broader local policy suite.
 
+When touching non-host targets, run the dedicated target validation directly
+where the required SDK/toolchain is available:
+
+```bash
+cargo check --workspace --target wasm32-unknown-unknown --locked
+cargo clippy --workspace --target wasm32-unknown-unknown --locked -- -D warnings
+cargo check --workspace --target aarch64-linux-android --locked
+cargo clippy --workspace --target aarch64-linux-android --locked -- -D warnings
+cargo check --workspace --target aarch64-apple-ios --locked
+cargo clippy --workspace --target aarch64-apple-ios --locked -- -D warnings
+```
+
 GitHub Actions is the authoritative cross-platform enforcement path. The CI
 matrix now runs `cargo check`, `cargo clippy`, and `cargo test` on Ubuntu,
-Windows, and macOS so platform-gated code is not treated as validated from one
-host alone.
+Windows, and macOS, and it also runs dedicated `wasm32-unknown-unknown`,
+`aarch64-linux-android`, and `aarch64-apple-ios` workspace `check` + `clippy`
+lanes so web/mobile regressions are caught before merge.
 
 ## First Visible Slice
 
@@ -117,20 +130,48 @@ The repo now includes a narrow runnable content-lab bootstrap:
 cargo run -p ic-game --locked
 ```
 
-Today this opens a Bevy window, draws the synthetic RA-style render proof in
-the background, overlays a first real-data content catalog for the locally
+Today this opens a borderless-fullscreen Bevy content lab, keeps the synthetic
+RA-style demo scene as background context, and mirrors the currently selected
+real resource onto the main 2D preview surface. It scans the locally
 configured Red Alert / Remastered roots, mounts logical members from `.mix` /
-`.meg` archives into that catalog, and now validates real `.shp`, `.pal`,
+`.meg` archives into one content graph, and validates real `.shp`, `.pal`,
 `.aud`, `.wav`, `.wsa`, `.vqa`, `.ini`, `.eng`, `.lut`, `.vqp`, `.fnt`, and
-`.tmp` resources through one content-lab GUI with a scrollable thumbnail wall,
-filename captions, an aspect-preserving focused preview/player pane, and
-selected-resource transport controls. The lab now starts in borderless
-fullscreen mode and exits on a deliberate double-`Esc` gesture. It is a
-resource-validation lab, not a full map loader or gameplay loop yet.
+`.tmp` resources through one GUI with:
 
-On Windows builds, the content lab also wires decoded WAV playback into Bevy's
-audio runtime. Non-Windows CI still validates the decode, waveform, and
-animation paths without requiring system audio libraries.
+- a scrollable thumbnail wall for visual resources
+- filename captions and diagnostics panels
+- an aspect-preserving focused preview/player pane
+- selected-resource transport controls
+
+The lab is a resource-validation tool, not a full map loader or gameplay loop
+yet.
+
+The default source roots are now host-native: Windows builds probe `C:\...`
+developer locations, while WSL/Linux builds probe the corresponding `/mnt/c`
+paths. You can override them with `IC_RA1_SAMPLE_DISC_ROOT`,
+`IC_RA1_SAMPLE_RAR`, `IC_RA1_SAMPLE_PALETTES`, and `IC_REMASTERED_ROOT`.
+The catalog scan now runs in the background after the window opens, so large
+installs should show a visible loading state instead of appearing hung before
+the first frame. Heavy movie preview preparation also runs on a background
+worker so selecting a VQA does not freeze the main UI thread before playback
+starts.
+
+Current controls:
+
+- `Arrow keys`: browse the visible gallery window
+- `PageUp` / `PageDown`: jump by gallery page
+- `Home` / `End`: jump to the first or last previewable entry
+- `Q` / `E`: switch source roots
+- `Space`: play/pause the selected preview
+- `Enter`: restart the selected preview
+- `,` / `.`: step animation/video frames
+- `Esc` twice: exit the fullscreen content lab
+
+On Windows builds, the content lab wires decoded preview audio into Bevy's
+audio runtime through a direct PCM path, covering decoded WAV/AUD data and VQA
+soundtracks without synthesizing temporary WAV files. Non-Windows CI still
+validates the decode, waveform, and animation paths without requiring system
+audio libraries.
 
 ## Current Crates
 

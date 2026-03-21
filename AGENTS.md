@@ -246,6 +246,19 @@ They are not optional style preferences.
 - Avoid obvious comments like "increment counter". The code already says that.
   Spend comments on context, rationale, and constraints.
 
+### Lifetime Naming
+
+- Lifetime parameter names must be meaningful: name the lifetime after the
+  item whose lifetime it represents (for example `'input` for an input
+  slice, `'buf` for a buffer, `'frame` for frame data, `'palette` for a
+  borrowed palette). Avoid vague single-letter names like `'a` in public
+  APIs; single-letter lifetimes may be acceptable in very small local
+  scopes or short-lived closures.
+- Prefer descriptive lifetime names in structs and function signatures so
+  reviewers and automated tools can immediately identify what is being
+  borrowed and why. This improves readability and reduces confusion when
+  multiple lifetimes are present.
+
 ### 3. Test Documentation Standard
 
 - Tests are part of the permanent design record. They must be readable without
@@ -259,6 +272,30 @@ They are not optional style preferences.
 - Test helpers must carry the same documentation standard as production code
   if they encode non-obvious binary layouts, fixtures, determinism setup, or
   scenario construction.
+
+### 3a. Test Fixture Legality and CI Portability
+
+- Never commit proprietary, copyrighted, or otherwise redistribution-restricted
+  game assets to this repository unless there is a clearly documented license
+  that explicitly allows public redistribution in git.
+- Do not assume that "modding is allowed" means "raw assets may be checked into
+  source control." Code, mods, and owned-install import workflows are separate
+  questions from public asset redistribution.
+- CI-required tests must be self-contained and legally redistributable. The
+  default solution is:
+  - generate tiny synthetic fixtures inline
+  - build minimal valid binary payloads with local test helpers
+  - use authored/open assets owned by this project
+  - assert metadata, decode behavior, round-trips, and invariants without
+    shipping original EA payloads
+- When real installed assets are useful for extra validation, keep that path
+  opt-in and local-only:
+  - gate it behind explicit environment variables or ignored/manual tests
+  - never make GitHub Actions depend on proprietary local installs
+  - document the source expectation and ownership requirement in the test docs
+- Prefer generated fixtures over opaque checked-in binaries. Generated fixtures
+  keep the legal status clearer, the test intent more readable, and the CI
+  story portable across fresh runners.
 
 ### 4. RAG / LLM-Friendly Project Tree
 
@@ -326,8 +363,8 @@ Do **not** open a request for:
 - **Build/run rule:** Agents must **not** use `cargo build`, `cargo run`, or equivalent binary/example launch commands for this repo unless the user explicitly requests them. Let the user build and run the project in their own environment.
 - **Why this rule exists:** The agent environment may not match the user's local graphics, windowing, driver, audio, or platform setup. Pure build/run attempts can waste time while proving less than the same compile work done through targeted tests or lint checks.
 - **Allowed verification paths:** `cargo clippy`, `cargo test`, `cargo check`, `cargo fmt --check`, `./ci`, `ci-local.sh`, `ci-local.ps1`, and other non-run validation commands are allowed. Prefer the repo dispatcher first, then direct cargo commands when a narrower probe is enough.
-- **Host-native validation rule:** `cfg(target_os)` and other platform-gated code is only considered validated when linted on that host OS or by the GitHub Actions OS matrix. Use `./ci lint` on Unix-like hosts, `./ci lint --host windows` from WSL when Windows PowerShell is available, and `.\ci.ps1 lint` on native Windows before claiming platform-specific code is green.
-- **CI expectations:** All tests pass, clippy clean (zero warnings), fmt check clean, and the GitHub Actions matrix stays green on Ubuntu, Windows, and macOS. `clippy::disallowed_types` enforces determinism rules in `ic-sim`
+- **Host-native validation rule:** `cfg(target_os)` and other platform-gated native code is only considered validated when linted on that host OS or by the GitHub Actions OS matrix. Non-host targets such as `wasm32-unknown-unknown`, `aarch64-linux-android`, and `aarch64-apple-ios` are only considered validated when checked/clippied for that exact target or by their dedicated GitHub Actions lanes. Use `./ci lint` on Unix-like hosts, `./ci lint --host windows` from WSL when Windows PowerShell is available, `.\ci.ps1 lint` on native Windows, and direct target `cargo check` / `cargo clippy` commands for web/mobile targets before claiming those code paths are green.
+- **CI expectations:** All tests pass, clippy clean (zero warnings), fmt check clean, and the GitHub Actions matrix stays green on Ubuntu, Windows, macOS, plus the dedicated `wasm32-unknown-unknown`, `aarch64-linux-android`, and `aarch64-apple-ios` lanes. `clippy::disallowed_types` enforces determinism rules in `ic-sim`
 - **Perf profiling:** `cargo bench` for hot-path microbenchmarks; Tracy/Superluminal for frame profiling
 - **Security constraints:** No `unsafe` without review comment. WASM mods use capability-gated API only (D005). Order validation is deterministic (D012). Replay hashes use Ed25519 signing (D010)
 

@@ -61,9 +61,21 @@ The core checks are:
 - `cargo audit`
 - MSRV verification on Rust `1.85`
 
+When a change touches non-host targets, also run the matching target checks
+where the required SDK/toolchain is available:
+
+- `cargo check --workspace --target wasm32-unknown-unknown --locked`
+- `cargo clippy --workspace --target wasm32-unknown-unknown --locked -- -D warnings`
+- `cargo check --workspace --target aarch64-linux-android --locked`
+- `cargo clippy --workspace --target aarch64-linux-android --locked -- -D warnings`
+- `cargo check --workspace --target aarch64-apple-ios --locked`
+- `cargo clippy --workspace --target aarch64-apple-ios --locked -- -D warnings`
+
 `cargo deny`, `cargo audit`, and MSRV checks depend on the corresponding local
 tools being installed. GitHub Actions remains the authoritative enforcement
-path and runs `check` / `clippy` / `test` on Ubuntu, Windows, and macOS.
+path and runs `check` / `clippy` / `test` on Ubuntu, Windows, and macOS plus
+dedicated `wasm32-unknown-unknown`, `aarch64-linux-android`, and
+`aarch64-apple-ios` `check` / `clippy` lanes.
 
 ## Pull Requests
 

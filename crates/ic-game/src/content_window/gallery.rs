@@ -23,7 +23,7 @@ use bevy::prelude::*;
 use bevy::ui::widget::ImageNode;
 
 use super::preview::{load_preview_for_entry, rgba_frame_to_image, ContentPreviewTracker};
-use super::state::{ContentGalleryWindow, ContentLabState};
+use super::state::{ContentGalleryWindow, ContentLabState, ContentWindowUiRoot};
 
 const GALLERY_LEFT: f32 = 332.0;
 const GALLERY_RIGHT: f32 = 388.0;
@@ -148,42 +148,51 @@ struct InspectorUiSpec {
 /// Their children are rebuilt later by `refresh_content_gallery`, but the root
 /// nodes stay stable so the rest of the UI layout can reason about fixed left,
 /// center, and right content zones.
-pub(crate) fn setup_content_gallery_ui(mut commands: Commands) {
-    commands.spawn((
-        ContentGalleryRoot,
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(GALLERY_TOP),
-            left: px(GALLERY_LEFT),
-            right: px(GALLERY_RIGHT),
-            bottom: px(GALLERY_BOTTOM),
-            flex_wrap: FlexWrap::Wrap,
-            align_content: AlignContent::FlexStart,
-            align_items: AlignItems::FlexStart,
-            row_gap: px(GALLERY_TILE_GAP),
-            column_gap: px(GALLERY_TILE_GAP),
-            padding: UiRect::all(px(8)),
-            overflow: Overflow::clip(),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.05, 0.07, 0.09, 0.78)),
-    ));
+pub(crate) fn setup_content_gallery_ui(
+    mut commands: Commands,
+    ui_root_query: Query<Entity, With<ContentWindowUiRoot>>,
+) {
+    let Some(ui_root) = ui_root_query.single().ok() else {
+        return;
+    };
 
-    commands.spawn((
-        ContentInspectorRoot,
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(16),
-            right: px(16),
-            width: px(INSPECTOR_WIDTH),
-            height: px(INSPECTOR_HEIGHT),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(8),
-            padding: UiRect::all(px(12)),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.06, 0.08, 0.10, 0.84)),
-    ));
+    commands.entity(ui_root).with_children(|parent| {
+        parent.spawn((
+            ContentGalleryRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(GALLERY_TOP),
+                left: px(GALLERY_LEFT),
+                right: px(GALLERY_RIGHT),
+                bottom: px(GALLERY_BOTTOM),
+                flex_wrap: FlexWrap::Wrap,
+                align_content: AlignContent::FlexStart,
+                align_items: AlignItems::FlexStart,
+                row_gap: px(GALLERY_TILE_GAP),
+                column_gap: px(GALLERY_TILE_GAP),
+                padding: UiRect::all(px(8)),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.07, 0.09, 0.78)),
+        ));
+
+        parent.spawn((
+            ContentInspectorRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(16),
+                right: px(16),
+                width: px(INSPECTOR_WIDTH),
+                height: px(INSPECTOR_HEIGHT),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(8),
+                padding: UiRect::all(px(12)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.06, 0.08, 0.10, 0.84)),
+        ));
+    });
 }
 
 /// Rebuilds the visible thumbnail wall and focused inspector when selection or
@@ -198,6 +207,7 @@ pub(crate) fn refresh_content_gallery(
     state: Res<ContentLabState>,
     mut preview_tracker: ResMut<ContentPreviewTracker>,
     mut gallery_tracker: ResMut<ContentGalleryTracker>,
+    archive_cache: Res<super::ArchivePreloadCache>,
     gallery_root_query: Query<Entity, With<ContentGalleryRoot>>,
     inspector_root_query: Query<Entity, With<ContentInspectorRoot>>,
     existing_transient_query: Query<Entity, With<ContentGalleryTransient>>,
@@ -210,7 +220,7 @@ pub(crate) fn refresh_content_gallery(
     };
 
     let gallery_window = state.gallery_window();
-    let next_signature = gallery_window.as_ref().map(signature_for_gallery_window);
+    let next_signature = Some(signature_for_gallery_state(&state, gallery_window.as_ref()));
     if gallery_tracker.current_signature == next_signature {
         return;
     }
@@ -222,6 +232,8 @@ pub(crate) fn refresh_content_gallery(
     preview_tracker.selected_image_entity = None;
 
     let Some(gallery_window) = gallery_window else {
+        spawn_empty_gallery_state(&mut commands, gallery_root, inspector_root, &state);
+        gallery_tracker.current_signature = next_signature;
         return;
     };
 
@@ -231,6 +243,7 @@ pub(crate) fn refresh_content_gallery(
         &mut images,
         &preview_tracker,
         &mut gallery_tracker,
+        &archive_cache,
     );
     let inspector_spec = build_inspector_spec(state.selected_entry(), &preview_tracker);
 
@@ -399,12 +412,120 @@ pub(crate) fn refresh_content_gallery(
     gallery_tracker.current_signature = next_signature;
 }
 
-fn signature_for_gallery_window(gallery_window: &ContentGalleryWindow) -> ContentGallerySignature {
-    ContentGallerySignature {
-        catalog_index: gallery_window.catalog_index,
-        selected_window_index: gallery_window.selected_window_index,
-        entry_indices: gallery_window.entry_indices.clone(),
+fn signature_for_gallery_state(
+    state: &ContentLabState,
+    gallery_window: Option<&ContentGalleryWindow>,
+) -> ContentGallerySignature {
+    match gallery_window {
+        Some(gallery_window) => ContentGallerySignature {
+            catalog_index: gallery_window.catalog_index,
+            selected_window_index: gallery_window.selected_window_index,
+            entry_indices: gallery_window.entry_indices.clone(),
+        },
+        None => ContentGallerySignature {
+            catalog_index: state.selected_catalog_index(),
+            selected_window_index: 0,
+            entry_indices: Vec::new(),
+        },
     }
+}
+
+fn spawn_empty_gallery_state(
+    commands: &mut Commands,
+    gallery_root: Entity,
+    inspector_root: Entity,
+    state: &ContentLabState,
+) {
+    let source_message = if state.is_loading() {
+        let mut lines = vec![
+            "Scanning Red Alert / Remastered content...".to_string(),
+            "The window is open; the catalog is still building in the background.".to_string(),
+            String::new(),
+            "Configured source roots:".to_string(),
+        ];
+        for source in state.configured_sources() {
+            lines.push(format!(
+                "- {}: {}",
+                source.display_name,
+                source.path.display()
+            ));
+        }
+        lines.join("\n")
+    } else {
+        state
+            .catalogs()
+            .get(state.selected_catalog_index())
+            .map(|catalog| {
+                format!(
+                    "No previewable visual resources were found in the current source.\n\nSource: {}\nPath: {}\nStatus: {}\n\nUse Q / E to switch source roots.\nIf this path is wrong on your machine, set:\nIC_RA1_SAMPLE_DISC_ROOT\nIC_RA1_SAMPLE_RAR\nIC_RA1_SAMPLE_PALETTES\nIC_REMASTERED_ROOT",
+                    catalog.source.display_name,
+                    catalog.source.path.display(),
+                    if catalog.available { "available" } else { "missing" },
+                )
+            })
+            .unwrap_or_else(|| {
+                "No content sources are configured.\n\nSet IC_RA1_SAMPLE_DISC_ROOT or IC_REMASTERED_ROOT before starting the content lab.".into()
+            })
+    };
+
+    commands.entity(gallery_root).with_children(|parent| {
+        parent
+            .spawn((
+                ContentGalleryTransient,
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::all(px(24)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.05, 0.07, 0.09, 0.78)),
+            ))
+            .with_children(|message_parent| {
+                message_parent.spawn((
+                    Text::new(source_message),
+                    TextFont {
+                        font_size: 22.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.92, 0.93, 0.94)),
+                    Node {
+                        max_width: px(780.0),
+                        ..default()
+                    },
+                ));
+            });
+    });
+
+    commands.entity(inspector_root).with_children(|parent| {
+        parent
+            .spawn((
+                ContentGalleryTransient,
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::all(px(12)),
+                    ..default()
+                },
+            ))
+            .with_children(|message_parent| {
+                message_parent.spawn((
+                    Text::new(if state.is_loading() {
+                        "Focused Preview\nWaiting for the content scan to finish."
+                    } else {
+                        "Focused Preview\nNo visual selection is available yet."
+                    }),
+                    TextFont {
+                        font_size: INSPECTOR_TITLE_TEXT_SIZE,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.92, 0.93, 0.94)),
+                ));
+            });
+    });
 }
 
 fn build_tile_specs(
@@ -413,15 +534,18 @@ fn build_tile_specs(
     images: &mut Assets<Image>,
     preview_tracker: &ContentPreviewTracker,
     gallery_tracker: &mut ContentGalleryTracker,
+    archive_cache: &super::ArchivePreloadCache,
 ) -> Vec<TileUiSpec> {
-    let catalog = &catalogs[gallery_window.catalog_index];
+    let Some(catalog) = catalogs.get(gallery_window.catalog_index) else {
+        return Vec::new();
+    };
 
     gallery_window
         .entry_indices
         .iter()
         .enumerate()
-        .map(|(window_index, entry_index)| {
-            let entry = &catalog.entries[*entry_index];
+        .filter_map(|(window_index, entry_index)| {
+            let entry = catalog.entries.get(*entry_index)?;
             let selected = window_index == gallery_window.selected_window_index;
 
             let (image_handle, image_size) = if selected {
@@ -437,16 +561,16 @@ fn build_tile_specs(
                     }),
                 )
             } else {
-                build_static_thumbnail(entry, catalogs, images, gallery_tracker)
+                build_static_thumbnail(entry, catalogs, images, gallery_tracker, archive_cache)
             };
 
-            TileUiSpec {
+            Some(TileUiSpec {
                 image_handle,
                 image_size,
                 selected,
                 caption: tile_caption(entry),
                 status: tile_status(entry),
-            }
+            })
         })
         .collect()
 }
@@ -456,10 +580,18 @@ fn build_static_thumbnail(
     catalogs: &[super::catalog::ContentCatalog],
     images: &mut Assets<Image>,
     gallery_tracker: &mut ContentGalleryTracker,
+    archive_cache: &super::ArchivePreloadCache,
 ) -> (Option<Handle<Image>>, Option<ContainedImageSize>) {
-    match load_preview_for_entry(entry, catalogs) {
+    // Videos are too expensive to decode synchronously for thumbnails.
+    // The selected entry uses the streaming preview tracker instead.
+    if super::preview::should_background_load_preview_for_family(entry.family) {
+        return (None, None);
+    }
+    match load_preview_for_entry(entry, catalogs, Some(archive_cache)) {
         Ok(Some(preview)) => preview.visual().map_or((None, None), |visual| {
-            let first_frame = &visual.frames()[0];
+            let Some(first_frame) = visual.frames().first() else {
+                return (None, None);
+            };
             let image_handle = images.add(rgba_frame_to_image(first_frame));
             gallery_tracker.thumbnail_handles.push(image_handle.clone());
             (

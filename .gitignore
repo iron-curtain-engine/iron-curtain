@@ -6,3 +6,6 @@
 Thumbs.db
 .env
 *.pdb
+
+# User config override (iron-curtain.default.toml is checked in)
+config/iron-curtain.toml

@@ -57,7 +57,7 @@ impl PcmAudioSource {
         )
     }
 
-    fn new(samples: Arc<[i16]>, sample_rate: u32, channels: u16) -> Self {
+    pub(crate) fn new(samples: Arc<[i16]>, sample_rate: u32, channels: u16) -> Self {
         assert!(sample_rate != 0, "preview PCM sample rate must not be zero");
         assert!(channels != 0, "preview PCM channel count must not be zero");
 

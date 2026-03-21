@@ -19,7 +19,7 @@ use bevy::prelude::*;
 
 use super::catalog::{
     default_local_source_roots, ContentCatalog, ContentCatalogEntry, ContentFamily,
-    ContentSupportLevel,
+    ContentSourceRoot, ContentSupportLevel,
 };
 use super::preview_decode::preview_capabilities_for_entry;
 
@@ -34,11 +34,23 @@ const ENTRY_HEIGHT: f32 = 0.0;
 const SELECTION_WIDTH: f32 = 340.0;
 const SELECTION_TOP: f32 = 340.0;
 const SELECTION_HEIGHT: f32 = 364.0;
+const CONTENT_WINDOW_UI_Z_INDEX: i32 = 100;
 pub(crate) const GALLERY_COLUMNS: usize = 2;
 pub(crate) const GALLERY_VISIBLE_ROWS: usize = 3;
 pub(crate) const GALLERY_VISIBLE_SLOTS: usize = GALLERY_COLUMNS * GALLERY_VISIBLE_ROWS;
 const PAGE_STEP: isize = GALLERY_VISIBLE_SLOTS as isize;
 pub(crate) const ESCAPE_EXIT_CONFIRMATION_WINDOW_SECS: f64 = 1.0;
+const SHOWCASE_RESOURCE_HINTS: &[&str] = &[
+    "TANYA1.VQA",
+    "TANYA2.VQA",
+    "INTRO.VQA",
+    "INTRO2.VQA",
+    "SIZZLE.VQA",
+    "SIZZLE2.VQA",
+    "TANYA1.VQP",
+    "TANYA2.VQP",
+    "1TNK.SHP",
+];
 
 /// A deterministic window of gallery entries that currently fit on screen.
 ///
@@ -79,31 +91,56 @@ impl EscapeExitShortcut {
 /// Mutable UI/navigation state for the content-lab overlay.
 #[derive(Resource, Debug, Clone)]
 pub struct ContentLabState {
+    configured_sources: Vec<ContentSourceRoot>,
     catalogs: Vec<ContentCatalog>,
     selected_catalog: usize,
     selected_entry: usize,
     dirty: bool,
+    loading: bool,
+    scan_progress: String,
     preview_summary: String,
     playback_summary: String,
 }
 
 impl ContentLabState {
+    /// Builds content-lab state that starts in a visible loading state while
+    /// the configured source roots are scanned on a background thread.
+    ///
+    /// This keeps large Red Alert / Remastered installs from blocking window
+    /// creation. The content lab should show a fullscreen loading UI first,
+    /// then populate with real resources once filesystem cataloging finishes.
+    pub fn loading(configured_sources: Vec<ContentSourceRoot>) -> Self {
+        Self {
+            configured_sources,
+            catalogs: Vec::new(),
+            selected_catalog: 0,
+            selected_entry: 0,
+            dirty: true,
+            loading: true,
+            scan_progress: String::new(),
+            preview_summary: "Scanning configured content roots...".into(),
+            playback_summary: "Preview runtime will appear once a resource is selected.".into(),
+        }
+    }
+
     /// Builds content-lab state from the hard-coded local developer roots.
     pub fn from_default_local_sources() -> Self {
-        let catalogs = default_local_source_roots()
-            .into_iter()
-            .map(ContentCatalog::scan)
-            .collect();
-        Self::new(catalogs)
+        Self::loading(default_local_source_roots())
     }
 
     /// Creates state from prebuilt catalogs.
     pub fn new(catalogs: Vec<ContentCatalog>) -> Self {
         let mut state = Self {
+            configured_sources: catalogs
+                .iter()
+                .map(|catalog| catalog.source.clone())
+                .collect(),
             catalogs,
             selected_catalog: 0,
             selected_entry: 0,
             dirty: true,
+            loading: false,
+            scan_progress: String::new(),
             preview_summary: "No preview has been loaded yet.".into(),
             playback_summary: "No active preview runtime.".into(),
         };
@@ -114,6 +151,31 @@ impl ContentLabState {
     /// Immutable view of the scanned catalogs.
     pub(crate) fn catalogs(&self) -> &[ContentCatalog] {
         &self.catalogs
+    }
+
+    /// Immutable view of the configured source roots, even before scanning
+    /// finishes.
+    pub(crate) fn configured_sources(&self) -> &[ContentSourceRoot] {
+        &self.configured_sources
+    }
+
+    /// Returns `true` while the background content scan is still running.
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// The most recent scan progress message from the background thread.
+    pub(crate) fn scan_progress(&self) -> &str {
+        &self.scan_progress
+    }
+
+    /// Updates the scan progress line shown in the loading indicator.
+    pub(crate) fn set_scan_progress(&mut self, progress: impl Into<String>) {
+        let progress = progress.into();
+        if self.scan_progress != progress {
+            self.scan_progress = progress;
+            self.dirty = true;
+        }
     }
 
     /// Zero-based currently selected catalog index.
@@ -246,6 +308,26 @@ impl ContentLabState {
         }
     }
 
+    /// Replaces the loading placeholder state with a completed scan result.
+    ///
+    /// This is called once the background scanner finishes walking the local
+    /// Red Alert / Remastered roots. It resets selection and picks the first
+    /// showcase-worthy visual entry so the user lands on recognizable data.
+    pub(crate) fn replace_catalogs(&mut self, catalogs: Vec<ContentCatalog>) {
+        self.configured_sources = catalogs
+            .iter()
+            .map(|catalog| catalog.source.clone())
+            .collect();
+        self.catalogs = catalogs;
+        self.selected_catalog = 0;
+        self.selected_entry = 0;
+        self.loading = false;
+        self.preview_summary = "No preview has been loaded yet.".into();
+        self.playback_summary = "No active preview runtime.".into();
+        self.select_first_gallery_entry();
+        self.dirty = true;
+    }
+
     /// Combined text dump kept for tests and quick debugging.
     pub fn render_text(&self) -> String {
         [
@@ -272,11 +354,31 @@ impl ContentLabState {
     }
 
     fn render_source_text(&self) -> String {
-        if self.catalogs.is_empty() {
-            return "No content sources are configured.".into();
+        if self.loading && self.catalogs.is_empty() {
+            let mut lines = vec![
+                "Scanning configured source roots...".into(),
+                format!("Configured sources: {}", self.configured_sources.len()),
+                String::new(),
+            ];
+
+            for source in &self.configured_sources {
+                lines.push(format!(
+                    "- {}: {}",
+                    source.display_name,
+                    source.path.display()
+                ));
+            }
+
+            return lines.join("\n");
         }
 
-        let catalog = &self.catalogs[self.selected_catalog.min(self.catalogs.len() - 1)];
+        let Some(catalog) = self
+            .catalogs
+            .get(self.selected_catalog)
+            .or_else(|| self.catalogs.last())
+        else {
+            return "No content sources are configured.".into();
+        };
         let previewable_count = catalog
             .entries
             .iter()
@@ -353,9 +455,14 @@ impl ContentLabState {
             return lines.join("\n");
         };
 
-        let catalog = &self.catalogs[gallery_window.catalog_index];
+        let Some(catalog) = self.catalogs.get(gallery_window.catalog_index) else {
+            lines.push("  - catalog index out of range".into());
+            return lines.join("\n");
+        };
         for (window_index, entry_index) in gallery_window.entry_indices.iter().enumerate() {
-            let entry = &catalog.entries[*entry_index];
+            let Some(entry) = catalog.entries.get(*entry_index) else {
+                continue;
+            };
             let marker = if window_index == gallery_window.selected_window_index {
                 ">"
             } else {
@@ -410,6 +517,33 @@ impl ContentLabState {
     }
 
     fn select_first_gallery_entry(&mut self) {
+        let showcase_match =
+            SHOWCASE_RESOURCE_HINTS
+                .iter()
+                .enumerate()
+                .find_map(|(preference_rank, _)| {
+                    self.catalogs
+                        .iter()
+                        .enumerate()
+                        .find_map(|(catalog_index, catalog)| {
+                            catalog
+                                .entries
+                                .iter()
+                                .enumerate()
+                                .find_map(|(entry_index, entry)| {
+                                    (is_gallery_entry(entry)
+                                        && showcase_preference_rank(entry) == Some(preference_rank))
+                                    .then_some((catalog_index, entry_index))
+                                })
+                        })
+                });
+
+        if let Some((catalog_index, entry_index)) = showcase_match {
+            self.selected_catalog = catalog_index;
+            self.selected_entry = entry_index;
+            return;
+        }
+
         for (catalog_index, catalog) in self.catalogs.iter().enumerate() {
             if let Some(entry_index) = catalog.entries.iter().position(is_gallery_entry) {
                 self.selected_catalog = catalog_index;
@@ -420,11 +554,23 @@ impl ContentLabState {
     }
 
     fn first_gallery_entry_index(&self, catalog_index: usize) -> Option<usize> {
-        self.catalogs
-            .get(catalog_index)?
-            .entries
+        let catalog = self.catalogs.get(catalog_index)?;
+
+        SHOWCASE_RESOURCE_HINTS
             .iter()
-            .position(is_gallery_entry)
+            .enumerate()
+            .find_map(|(preference_rank, _)| {
+                catalog
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .find_map(|(entry_index, entry)| {
+                        (is_gallery_entry(entry)
+                            && showcase_preference_rank(entry) == Some(preference_rank))
+                        .then_some(entry_index)
+                    })
+            })
+            .or_else(|| catalog.entries.iter().position(is_gallery_entry))
     }
 
     fn selected_catalog(&self) -> Option<&ContentCatalog> {
@@ -447,6 +593,9 @@ impl ContentLabState {
 pub(crate) struct ContentWindowHeaderText;
 
 #[derive(Component)]
+pub(crate) struct ContentWindowUiRoot;
+
+#[derive(Component)]
 pub(crate) struct ContentWindowSourceText;
 
 #[derive(Component)]
@@ -461,90 +610,126 @@ pub(crate) struct ContentWindowSelectionText;
 /// `Text` component and a `Node` layout component. Keeping the panels separate
 /// matters here because this tool needs distinct "what source is mounted?",
 /// "what entry is selected?", and "is the preview actually playing?" surfaces.
+///
+/// The content lab now uses one explicit fullscreen UI root instead of several
+/// unrelated top-level nodes. That keeps the entire overlay in one hierarchy,
+/// makes absolute panel positioning relative to the monitor-sized root instead
+/// of the implicit global stack, and avoids the "only the world sprite shows"
+/// failure mode when the UI tree is hard to reason about.
 pub(crate) fn setup_content_window_ui(mut commands: Commands, state: Res<ContentLabState>) {
     let panel_bg = Color::srgba(0.06, 0.08, 0.10, 0.84);
     let panel_text = Color::srgb(0.90, 0.91, 0.92);
 
-    commands.spawn((
-        ContentWindowHeaderText,
-        Text::new(state.render_header_text()),
-        TextFont {
-            font_size: HEADER_TEXT_SIZE,
-            ..default()
-        },
-        TextColor(panel_text),
-        BackgroundColor(panel_bg),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(16),
-            left: px(16),
-            width: px(PANEL_WIDTH),
-            height: px(HEADER_HEIGHT),
-            padding: UiRect::all(px(12)),
-            ..default()
-        },
-    ));
+    commands
+        .spawn((
+            ContentWindowUiRoot,
+            Node {
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            GlobalZIndex(CONTENT_WINDOW_UI_Z_INDEX),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                ContentWindowHeaderText,
+                Text::new(state.render_header_text()),
+                TextFont {
+                    font_size: HEADER_TEXT_SIZE,
+                    ..default()
+                },
+                TextColor(panel_text),
+                BackgroundColor(panel_bg),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(16),
+                    left: px(16),
+                    width: px(PANEL_WIDTH),
+                    height: px(HEADER_HEIGHT),
+                    padding: UiRect::all(px(12)),
+                    ..default()
+                },
+            ));
 
-    commands.spawn((
-        ContentWindowSourceText,
-        Text::new(state.render_source_text()),
-        TextFont {
-            font_size: PANEL_TEXT_SIZE,
-            ..default()
-        },
-        TextColor(panel_text),
-        BackgroundColor(panel_bg),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(SOURCE_TOP),
-            left: px(16),
-            width: px(PANEL_WIDTH),
-            height: px(SOURCE_HEIGHT),
-            padding: UiRect::all(px(12)),
-            ..default()
-        },
-    ));
+            parent.spawn((
+                ContentWindowSourceText,
+                Text::new(state.render_source_text()),
+                TextFont {
+                    font_size: PANEL_TEXT_SIZE,
+                    ..default()
+                },
+                TextColor(panel_text),
+                BackgroundColor(panel_bg),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(SOURCE_TOP),
+                    left: px(16),
+                    width: px(PANEL_WIDTH),
+                    height: px(SOURCE_HEIGHT),
+                    padding: UiRect::all(px(12)),
+                    ..default()
+                },
+            ));
 
-    commands.spawn((
-        ContentWindowEntryListText,
-        Text::new(state.render_entry_list_text()),
-        TextFont {
-            font_size: PANEL_TEXT_SIZE,
-            ..default()
-        },
-        TextColor(panel_text),
-        BackgroundColor(panel_bg),
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: px(ENTRY_BOTTOM),
-            left: px(16),
-            width: px(PANEL_WIDTH),
-            height: px(ENTRY_HEIGHT),
-            padding: UiRect::all(px(12)),
-            display: Display::None,
-            ..default()
-        },
-    ));
+            parent.spawn((
+                ContentWindowEntryListText,
+                Text::new(state.render_entry_list_text()),
+                TextFont {
+                    font_size: PANEL_TEXT_SIZE,
+                    ..default()
+                },
+                TextColor(panel_text),
+                BackgroundColor(panel_bg),
+                Node {
+                    position_type: PositionType::Absolute,
+                    bottom: px(ENTRY_BOTTOM),
+                    left: px(16),
+                    width: px(PANEL_WIDTH),
+                    height: px(ENTRY_HEIGHT),
+                    padding: UiRect::all(px(12)),
+                    display: Display::None,
+                    ..default()
+                },
+            ));
 
-    commands.spawn((
-        ContentWindowSelectionText,
-        Text::new(state.render_selection_text()),
-        TextFont {
-            font_size: PANEL_TEXT_SIZE,
-            ..default()
-        },
-        TextColor(panel_text),
-        BackgroundColor(panel_bg),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(SELECTION_TOP),
-            right: px(16),
-            width: px(SELECTION_WIDTH),
-            height: px(SELECTION_HEIGHT),
-            padding: UiRect::all(px(12)),
-            ..default()
-        },
-    ));
+            parent.spawn((
+                ContentWindowSelectionText,
+                Text::new(state.render_selection_text()),
+                TextFont {
+                    font_size: PANEL_TEXT_SIZE,
+                    ..default()
+                },
+                TextColor(panel_text),
+                BackgroundColor(panel_bg),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(SELECTION_TOP),
+                    right: px(16),
+                    width: px(SELECTION_WIDTH),
+                    height: px(SELECTION_HEIGHT),
+                    padding: UiRect::all(px(12)),
+                    ..default()
+                },
+            ));
+        });
+}
+
+/// Returns `true` when the given visual entry is one of the early showcase
+/// assets we want to land on first.
+///
+/// The content lab is a validation tool, but first impressions still matter.
+/// If the current source tree contains well-known resources like `TANYA1.VQA`
+/// or `INTRO.VQA`, the initial selection should surface those before generic
+/// sprites such as `1TNK.SHP`. That makes it obvious the browser is really
+/// reading Red Alert data rather than only rendering the synthetic bootstrap
+/// art.
+fn showcase_preference_rank(entry: &ContentCatalogEntry) -> Option<usize> {
+    let file_name_upper = entry.location.file_name_upper();
+    let relative_path_upper = entry.relative_path.to_ascii_uppercase();
+
+    SHOWCASE_RESOURCE_HINTS
+        .iter()
+        .position(|hint| file_name_upper == *hint || relative_path_upper.ends_with(hint))
 }
 
 /// Keyboard navigation for the content browser.

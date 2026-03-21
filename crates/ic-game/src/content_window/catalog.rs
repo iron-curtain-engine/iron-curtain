@@ -12,9 +12,36 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ic_cnc_content::meg::MegArchive;
-use ic_cnc_content::mix::MixArchive;
 use ic_cnc_content::source::{ContentSourceKind, SourceRightsClass};
+
+const ENV_RA1_SAMPLE_DISC_ROOT: &str = "IC_RA1_SAMPLE_DISC_ROOT";
+const ENV_RA1_SAMPLE_RAR: &str = "IC_RA1_SAMPLE_RAR";
+const ENV_RA1_SAMPLE_PALETTES: &str = "IC_RA1_SAMPLE_PALETTES";
+const ENV_REMASTERED_ROOT: &str = "IC_REMASTERED_ROOT";
+
+#[cfg(target_os = "windows")]
+const DEFAULT_RA1_SAMPLE_DISC_ROOT: &str = r"C:\git\games\cnc-formats\samples\CD1_ALLIED_DISC";
+#[cfg(not(target_os = "windows"))]
+const DEFAULT_RA1_SAMPLE_DISC_ROOT: &str = "/mnt/c/git/games/cnc-formats/samples/CD1_ALLIED_DISC";
+
+#[cfg(target_os = "windows")]
+const DEFAULT_RA1_SAMPLE_RAR: &str = r"C:\Users\DK\Downloads\RedAlert1_AlliedDisc.rar";
+#[cfg(not(target_os = "windows"))]
+const DEFAULT_RA1_SAMPLE_RAR: &str = "/mnt/c/Users/DK/Downloads/RedAlert1_AlliedDisc.rar";
+
+#[cfg(target_os = "windows")]
+const DEFAULT_RA1_SAMPLE_PALETTES: &str =
+    r"C:\git\games\cnc-formats\samples\CD1_ALLIED_DISC\extract2\LOCAL_OUTPUT";
+#[cfg(not(target_os = "windows"))]
+const DEFAULT_RA1_SAMPLE_PALETTES: &str =
+    "/mnt/c/git/games/cnc-formats/samples/CD1_ALLIED_DISC/extract2/LOCAL_OUTPUT";
+
+#[cfg(target_os = "windows")]
+const DEFAULT_REMASTERED_ROOT: &str =
+    r"C:\Program Files (x86)\Steam\steamapps\common\CnCRemastered";
+#[cfg(not(target_os = "windows"))]
+const DEFAULT_REMASTERED_ROOT: &str =
+    "/mnt/c/Program Files (x86)/Steam/steamapps/common/CnCRemastered";
 
 /// One configured content source root shown in the lab.
 ///
@@ -258,6 +285,7 @@ impl ContentEntryLocation {
                 archive_index,
                 crc_raw,
                 logical_name,
+                ..
             } => {
                 let logical_name = logical_name
                     .as_deref()
@@ -286,6 +314,7 @@ impl ContentEntryLocation {
                 archive_index,
                 crc_raw,
                 logical_name,
+                ..
             } => format!(
                 "mix:{}:{archive_index}:{crc_raw:08X}:{}",
                 archive_path.display(),
@@ -320,6 +349,76 @@ impl ContentCatalog {
     ///
     /// The first pass only inspects filesystem metadata. Parsing file contents
     /// belongs to the preview/player passes that sit on top of this catalog.
+    /// Scans the source root, sending human-readable progress strings through
+    /// the channel so the UI can show WHERE and WHAT is being scanned.
+    pub fn scan_with_progress(
+        source: ContentSourceRoot,
+        progress: &std::sync::mpsc::Sender<String>,
+    ) -> Self {
+        let _ = progress.send(format!(
+            "Scanning: {} ({})",
+            source.display_name,
+            source.path.display()
+        ));
+        let path = source.path.clone();
+        let mut catalog = Self {
+            source,
+            available: false,
+            entries: Vec::new(),
+            notes: Vec::new(),
+            total_bytes: 0,
+            family_counts: BTreeMap::new(),
+            support_counts: BTreeMap::new(),
+        };
+
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                catalog.available = true;
+                if metadata.is_file()
+                    || catalog.source.root_shape == ContentRootShape::SingleFile
+                {
+                    let relative_path = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    catalog.push_entry(
+                        ContentCatalogEntry {
+                            relative_path: relative_path.clone(),
+                            location: ContentEntryLocation::filesystem(path.clone()),
+                            size_bytes: metadata.len(),
+                            family: classify_family(&path),
+                            support: classify_support(&path),
+                        },
+                        true,
+                    );
+                    catalog.mount_archive_members(&path, &relative_path, Some(progress));
+                } else if metadata.is_dir() {
+                    catalog.scan_directory_tree_with_progress(&path, progress);
+                } else {
+                    catalog
+                        .notes
+                        .push("source exists but is neither a regular file nor directory".into());
+                }
+            }
+            Err(error) => {
+                catalog
+                    .notes
+                    .push(format!("source path is unavailable: {error}"));
+            }
+        }
+
+        catalog.entries.sort_by(|left, right| {
+            left.relative_path
+                .cmp(&right.relative_path)
+                .then_with(|| left.location.sort_key().cmp(&right.location.sort_key()))
+        });
+        catalog
+    }
+
+    /// Scans the source root into a deterministic catalog.
+    ///
+    /// The first pass only inspects filesystem metadata. Parsing file contents
+    /// belongs to the preview/player passes that sit on top of this catalog.
     pub fn scan(source: ContentSourceRoot) -> Self {
         let path = source.path.clone();
         let mut catalog = Self {
@@ -350,7 +449,7 @@ impl ContentCatalog {
                         },
                         true,
                     );
-                    catalog.mount_archive_members(&path, &relative_path);
+                    catalog.mount_archive_members(&path, &relative_path, None);
                 } else if metadata.is_dir() {
                     catalog.scan_directory_tree(&path);
                 } else {
@@ -385,6 +484,22 @@ impl ContentCatalog {
     }
 
     fn scan_directory_tree(&mut self, root: &Path) {
+        self.scan_directory_tree_inner(root, None);
+    }
+
+    fn scan_directory_tree_with_progress(
+        &mut self,
+        root: &Path,
+        progress: &std::sync::mpsc::Sender<String>,
+    ) {
+        self.scan_directory_tree_inner(root, Some(progress));
+    }
+
+    fn scan_directory_tree_inner(
+        &mut self,
+        root: &Path,
+        progress: Option<&std::sync::mpsc::Sender<String>>,
+    ) {
         let mut stack = vec![root.to_path_buf()];
 
         while let Some(directory) = stack.pop() {
@@ -456,34 +571,49 @@ impl ContentCatalog {
                     },
                     true,
                 );
-                self.mount_archive_members(&path, &relative_path);
+                self.mount_archive_members(&path, &relative_path, progress);
             }
         }
     }
 
-    fn mount_archive_members(&mut self, archive_path: &Path, archive_relative_path: &str) {
+    fn mount_archive_members(
+        &mut self,
+        archive_path: &Path,
+        archive_relative_path: &str,
+        progress: Option<&std::sync::mpsc::Sender<String>>,
+    ) {
         match normalized_extension(archive_path).as_deref() {
-            Some("mix") => self.mount_mix_members(archive_path, archive_relative_path),
+            Some("mix") => {
+                if let Some(tx) = progress {
+                    let _ = tx.send(format!("Opening archive: {}", archive_relative_path));
+                }
+                self.mount_mix_members(archive_path, archive_relative_path);
+            }
             Some("meg") | Some("pgm") => {
-                self.mount_meg_members(archive_path, archive_relative_path)
+                if let Some(tx) = progress {
+                    let _ = tx.send(format!("Opening archive: {}", archive_relative_path));
+                }
+                self.mount_meg_members(archive_path, archive_relative_path);
             }
             _ => {}
         }
     }
 
     fn mount_mix_members(&mut self, archive_path: &Path, archive_relative_path: &str) {
-        let bytes = match fs::read(archive_path) {
-            Ok(bytes) => bytes,
+        use ic_cnc_content::cnc_formats::mix::MixArchiveReader;
+
+        let file = match fs::File::open(archive_path) {
+            Ok(f) => f,
             Err(error) => {
                 self.notes.push(format!(
-                    "could not read MIX archive {}: {error}",
+                    "could not open MIX archive {}: {error}",
                     archive_path.display()
                 ));
                 return;
             }
         };
-        let archive = match MixArchive::parse(bytes) {
-            Ok(archive) => archive,
+        let mut reader = match MixArchiveReader::open(std::io::BufReader::new(file)) {
+            Ok(r) => r,
             Err(error) => {
                 self.notes.push(format!(
                     "could not parse MIX archive {}: {error}",
@@ -492,37 +622,37 @@ impl ContentCatalog {
                 return;
             }
         };
-        let builtin_names = ic_cnc_content::cnc_formats::mix::builtin_name_map();
-        let staged_entries = match archive.staged_entries() {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.notes.push(format!(
-                    "could not enumerate MIX archive {}: {error}",
-                    archive_path.display()
-                ));
-                return;
-            }
-        };
 
-        for staged in staged_entries {
-            let logical_name = staged
-                .logical_name
-                .or_else(|| builtin_names.get(&staged.crc).cloned())
+        let builtin_names = ic_cnc_content::cnc_formats::mix::builtin_name_map();
+        let embedded_names = reader.embedded_names().unwrap_or_default();
+
+        let entries: Vec<_> = reader
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.crc, e.offset, e.size))
+            .collect();
+
+        for (archive_index, crc, _offset, size) in entries {
+            let logical_name = embedded_names
+                .get(&crc)
+                .cloned()
+                .or_else(|| builtin_names.get(&crc).cloned())
                 .map(|name| normalize_member_path(&name));
             let logical_display_name = logical_name
                 .clone()
-                .unwrap_or_else(|| format!("CRC_{:08X}.BIN", staged.crc.to_raw()));
+                .unwrap_or_else(|| format!("CRC_{:08X}.BIN", crc.to_raw()));
             let logical_path = Path::new(&logical_display_name);
             self.push_entry(
                 ContentCatalogEntry {
                     relative_path: format!("{archive_relative_path}::{logical_display_name}"),
                     location: ContentEntryLocation::MixMember {
                         archive_path: archive_path.to_path_buf(),
-                        archive_index: staged.archive_index,
-                        crc_raw: staged.crc.to_raw(),
+                        archive_index,
+                        crc_raw: crc.to_raw(),
                         logical_name,
                     },
-                    size_bytes: staged.size as u64,
+                    size_bytes: size as u64,
                     family: classify_family(logical_path),
                     support: classify_support(logical_path),
                 },
@@ -532,18 +662,20 @@ impl ContentCatalog {
     }
 
     fn mount_meg_members(&mut self, archive_path: &Path, archive_relative_path: &str) {
-        let bytes = match fs::read(archive_path) {
-            Ok(bytes) => bytes,
+        use ic_cnc_content::cnc_formats::meg::MegArchiveReader;
+
+        let file = match fs::File::open(archive_path) {
+            Ok(f) => f,
             Err(error) => {
                 self.notes.push(format!(
-                    "could not read MEG archive {}: {error}",
+                    "could not open MEG archive {}: {error}",
                     archive_path.display()
                 ));
                 return;
             }
         };
-        let archive = match MegArchive::parse(bytes) {
-            Ok(archive) => archive,
+        let reader = match MegArchiveReader::open(std::io::BufReader::new(file)) {
+            Ok(r) => r,
             Err(error) => {
                 self.notes.push(format!(
                     "could not parse MEG archive {}: {error}",
@@ -552,19 +684,16 @@ impl ContentCatalog {
                 return;
             }
         };
-        let staged_entries = match archive.staged_entries() {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.notes.push(format!(
-                    "could not enumerate MEG archive {}: {error}",
-                    archive_path.display()
-                ));
-                return;
-            }
-        };
 
-        for staged in staged_entries {
-            let logical_name = normalize_member_path(&staged.logical_name);
+        let entries: Vec<_> = reader
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.name.clone(), e.size))
+            .collect();
+
+        for (archive_index, name, size) in entries {
+            let logical_name = normalize_member_path(&name);
             let logical_path = Path::new(&logical_name);
             let family = classify_family(logical_path);
             let support = classify_support(logical_path);
@@ -573,10 +702,10 @@ impl ContentCatalog {
                     relative_path: format!("{archive_relative_path}::{logical_name}"),
                     location: ContentEntryLocation::MegMember {
                         archive_path: archive_path.to_path_buf(),
-                        archive_index: staged.archive_index,
+                        archive_index,
                         logical_name,
                     },
-                    size_bytes: staged.size,
+                    size_bytes: size,
                     family,
                     support,
                 },
@@ -597,27 +726,69 @@ impl ContentCatalog {
 
 /// Returns the current hard-coded local roots used by the first content lab.
 ///
+/// The defaults are host-native because the content lab is a developer tool
+/// that runs on the local machine. A Windows build should probe `C:\...`
+/// locations, while a WSL/Linux build should probe the corresponding `/mnt/c`
+/// locations. Each path can also be overridden with environment variables so a
+/// maintainer can point the lab at a different install without patching code.
+///
 /// The extracted palette sample is included only when it actually exists. That
 /// keeps the UI from showing a noisy missing root on machines that only have
 /// the base sample disc and not the extra extracted helper directory.
+/// Builds source roots from the TOML config `[[sources]]` entries.
+///
+/// Falls back to the legacy hardcoded defaults when the config has no sources.
+pub fn source_roots_from_config(config: &crate::config::GameConfig) -> Vec<ContentSourceRoot> {
+    if config.sources.is_empty() {
+        return default_local_source_roots();
+    }
+
+    config
+        .sources
+        .iter()
+        .map(|src| {
+            let path = crate::config::resolve_source_path(&src.path);
+            let source_kind = match src.kind.as_str() {
+                "steam" => ContentSourceKind::Steam,
+                "gog" => ContentSourceKind::Gog,
+                "ea-app" => ContentSourceKind::EaApp,
+                "openra" => ContentSourceKind::OpenRa,
+                _ => ContentSourceKind::ManualDirectory,
+            };
+            let rights_class = match src.rights.as_str() {
+                "open-content" => SourceRightsClass::OpenContent,
+                "local-custom" => SourceRightsClass::LocalCustom,
+                _ => SourceRightsClass::OwnedProprietary,
+            };
+            match src.shape.as_str() {
+                "single-file" => {
+                    ContentSourceRoot::single_file(&src.name, path, source_kind, rights_class)
+                }
+                _ => ContentSourceRoot::directory(&src.name, path, source_kind, rights_class),
+            }
+        })
+        .collect()
+}
+
 pub fn default_local_source_roots() -> Vec<ContentSourceRoot> {
+    let sample_disc_root = configured_path(ENV_RA1_SAMPLE_DISC_ROOT, DEFAULT_RA1_SAMPLE_DISC_ROOT);
+    let sample_rar = configured_path(ENV_RA1_SAMPLE_RAR, DEFAULT_RA1_SAMPLE_RAR);
     let mut roots = vec![
         ContentSourceRoot::directory(
             "RA1 Allied Disc Sample",
-            PathBuf::from("/mnt/c/git/games/cnc-formats/samples/CD1_ALLIED_DISC"),
+            sample_disc_root,
             ContentSourceKind::ManualDirectory,
             SourceRightsClass::OwnedProprietary,
         ),
         ContentSourceRoot::single_file(
             "RA1 Allied Disc RAR",
-            PathBuf::from("/mnt/c/Users/DK/Downloads/RedAlert1_AlliedDisc.rar"),
+            sample_rar,
             ContentSourceKind::ManualDirectory,
             SourceRightsClass::OwnedProprietary,
         ),
     ];
 
-    let sample_palette_root =
-        PathBuf::from("/mnt/c/git/games/cnc-formats/samples/CD1_ALLIED_DISC/extract2/LOCAL_OUTPUT");
+    let sample_palette_root = configured_path(ENV_RA1_SAMPLE_PALETTES, DEFAULT_RA1_SAMPLE_PALETTES);
     if sample_palette_root.is_dir() {
         roots.push(ContentSourceRoot::directory(
             "RA1 Sample Palettes",
@@ -629,12 +800,19 @@ pub fn default_local_source_roots() -> Vec<ContentSourceRoot> {
 
     roots.push(ContentSourceRoot::directory(
         "C&C Remastered Collection",
-        PathBuf::from("/mnt/c/Program Files (x86)/Steam/steamapps/common/CnCRemastered"),
+        configured_path(ENV_REMASTERED_ROOT, DEFAULT_REMASTERED_ROOT),
         ContentSourceKind::Steam,
         SourceRightsClass::OwnedProprietary,
     ));
 
     roots
+}
+
+fn configured_path(environment_key: &str, default_path: &str) -> PathBuf {
+    std::env::var_os(environment_key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default_path))
 }
 
 fn classify_family(path: &Path) -> ContentFamily {

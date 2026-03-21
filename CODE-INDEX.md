@@ -37,8 +37,9 @@
 - Current placeholder directories with no substantive implementation yet:
   - `tests/`
   - `assets/`
-  - `docs/design-gap-requests/`
   - `docs/implementation-notes/`
+- Current local documentation note directories:
+  - `docs/design-gap-requests/`
 - Planned crates such as `ic-sim`, `ic-ui`, `ic-net`, and others
   are design-level architecture only right now. They do not exist in this repo
   yet and must not be treated as editable local code paths.
@@ -56,6 +57,7 @@
 | Add or change archive-mounted content browsing | `crates/ic-game/src/content_window/catalog.rs` | `crates/ic-game/src/content_window/gallery.rs`, `crates/ic-game/src/content_window/preview_decode.rs`, `crates/ic-game/src/content_window/preview.rs`, `crates/ic-game/src/content_window/preview_audio.rs`, `crates/ic-game/src/content_window/tests.rs`, `crates/ic-cnc-content/src/mix/mod.rs`, `crates/ic-cnc-content/src/meg/mod.rs` | creating a second byte-loading path that only works for archive members or only for loose files |
 | Add or change render-side camera math or static-scene validation | `crates/ic-render/src/lib.rs` | `crates/ic-render/src/camera/mod.rs`, `crates/ic-render/src/scene/mod.rs`, matching `tests.rs`, D017, D041, `tracker/checklists.md` `G2` | coupling early render code to missing sim crates or re-parsing format files |
 | Add or change the runnable game-client bootstrap | `crates/ic-game/src/lib.rs` | `crates/ic-game/src/content_window/mod.rs`, `crates/ic-game/src/content_window/catalog.rs`, `crates/ic-game/src/content_window/state.rs`, `crates/ic-game/src/content_window/gallery.rs`, `crates/ic-game/src/content_window/preview_decode.rs`, `crates/ic-game/src/content_window/preview.rs`, `crates/ic-game/src/content_window/preview_audio.rs`, `crates/ic-game/src/content_window/tests.rs`, `crates/ic-game/src/demo.rs`, `crates/ic-render/src/camera/mod.rs`, `crates/ic-render/src/scene/mod.rs` | inventing gameplay or map-loading behavior that the current `G2` slice does not have yet |
+| Add or change executable allocator selection | `crates/ic-game/src/allocator.rs` | `crates/ic-game/src/main.rs`, performance design docs on global allocator policy | hiding process-wide allocator policy inside a shared library crate or diverging from the native-vs-WASM target split |
 | Learn how Bevy is used here | `crates/ic-cnc-content/src/lib.rs` | format loaders under `crates/ic-cnc-content/src/*/mod.rs`, matching tests | assuming full engine-runtime Bevy patterns already exist |
 | Run repo validation with the stable entrypoint | `./ci lint`, `./ci test`, `./ci all` | `ci`, `ci-local.sh`, `ci-local.ps1`, `.github/workflows/ci.yml` | bypassing the repo dispatcher and forgetting which host wrapper proves which code path |
 | Run host-native lint first | `ci-local.sh lint` or `ci-local.ps1 lint` | `.github/workflows/ci.yml`, `AGENTS.md` validation rules | treating Linux lint as proof for Windows-only code or vice versa |
@@ -89,8 +91,8 @@
 | `crates/ic-protocol/` | Shared protocol crate | Boundary types used by future sim/net work |
 | `crates/ic-cnc-content/` | Bevy-facing content integration crate | Wraps `cnc-formats` with engine-specific asset loading behavior for loose formats and archive containers |
 | `crates/ic-render/` | Render bootstrap crate | Owns render-side camera resources and static-scene validation for the future viewport |
-| `crates/ic-game/` | Runnable game-client bootstrap crate | Opens the content lab window, catalogs local RA/Remastered roots, mounts archive members, and validates actual art/audio/video/text resources through an aspect-preserving thumbnail gallery plus focused preview/player and diagnostics panels |
-| `docs/` | Local implementation notes | Currently placeholder directories only |
+| `crates/ic-game/` | Runnable game-client bootstrap crate | Opens the fullscreen content lab, scans local RA/Remastered roots on a background worker, mounts archive members, and validates actual art/audio/video/text resources through an aspect-preserving thumbnail gallery, focused preview/player, diagnostics panels, and a world-space selected-preview surface |
+| `docs/` | Local implementation notes | Includes local design-gap requests alongside implementation notes |
 | `tests/` | Future integration test home | Currently placeholder only |
 | `assets/` | Future test/sample assets | Currently placeholder only |
 | `images/` | Branding/media assets | Logo, LM-ready, and Rust-inside imagery used by the README |
@@ -140,14 +142,14 @@
 
 - **Path:** `crates/ic-game/`
 - **Primary responsibility:** runnable Bevy content lab for the first real-data viewport proof
-- **Owns:** window/plugin setup, the synthetic SHP/PAL-backed background demo scene, the local content-source catalog, the mounted loose-file / `.mix` / `.meg` content graph, pure preview decoding for art/audio/video/text resources, the scrollable thumbnail gallery, the focused preview/player pane, Bevy-side transport controls, and the diagnostics panels that browse configured RA / Remastered roots
+- **Owns:** fullscreen window/plugin setup, the native global-allocator choice for the executable entrypoint, the synthetic SHP/PAL-backed background demo scene, the local content-source catalog, the mounted loose-file / `.mix` / `.meg` content graph, pure preview decoding for art/audio/video/text resources, background catalog scan and heavy preview preparation tasks, the scrollable thumbnail gallery, the focused preview/player pane, the world-space selected-preview billboard, Bevy-side transport controls, direct PCM preview audio on Windows, and the diagnostics panels that browse configured RA / Remastered roots
 - **Does not own:** gameplay state, map loading, asset discovery, simulation, UI chrome, or the final palette-aware renderer
-- **Key files to read first:** `src/lib.rs`, then `src/content_window/mod.rs`, `src/content_window/catalog.rs`, `src/content_window/state.rs`, `src/content_window/gallery.rs`, `src/content_window/preview_decode.rs`, `src/content_window/preview_audio.rs`, `src/content_window/preview.rs`, `src/content_window/tests.rs`, `src/demo.rs`, `src/tests.rs`, `src/main.rs`
+- **Key files to read first:** `src/lib.rs`, `src/allocator.rs`, then `src/content_window/mod.rs`, `src/content_window/catalog.rs`, `src/content_window/state.rs`, `src/content_window/gallery.rs`, `src/content_window/preview_decode.rs`, `src/content_window/preview_audio.rs`, `src/content_window/preview.rs`, `src/content_window/tests.rs`, `src/demo.rs`, `src/tests.rs`, `src/main.rs`
 - **Tests / verification entry points:** `src/tests.rs`, `src/content_window/tests.rs`
-- **Common change risks:** pulling in Bevy platform features that do not match local CI environments, bypassing the `ic-cnc-content`/`ic-render` handoff with ad-hoc image loading, splitting pure decode logic from Bevy runtime logic incorrectly, splitting loose-file and archive-member handling into separate incompatible codepaths, distorting source aspect ratios in the gallery/inspector, letting gallery state drift from the selected preview runtime, or describing the content lab as a full game loop when it is only a visibility/browsing proof
+- **Common change risks:** pulling in Bevy platform features that do not match local CI environments, bypassing the `ic-cnc-content`/`ic-render` handoff with ad-hoc image loading, splitting pure decode logic from Bevy runtime logic incorrectly, splitting loose-file and archive-member handling into separate incompatible codepaths, blocking the main thread with filesystem scans or heavy video prep, distorting source aspect ratios in the gallery/inspector/movie mode, letting gallery state drift from the selected preview runtime, or describing the content lab as a full game loop when it is only a visibility/browsing proof
 - **Related design decisions (`Dxxx`):** D017, D041, D076
 - **Related execution steps (`G*`):** `G2`
-- **Search hints:** `run_content_window_client`, `ContentLabState`, `ContentCatalog`, `ContentEntryLocation`, `ContentGalleryTracker`, `ContainedImageSize`, `PreparedContentPreview`, `PcmAudioSource`, `ContentPreviewTracker`, `setup_content_gallery_ui`, `BootstrapDemoScene`, `setup_demo_scene`
+- **Search hints:** `run_content_window_client`, `allocator_backend_name`, `IcGameGlobalAllocator`, `ContentLabState`, `ContentCatalog`, `ContentEntryLocation`, `ContentGalleryTracker`, `ContainedImageSize`, `PreparedContentPreview`, `ContentPreviewLoadTask`, `VisualPreviewSession`, `PcmAudioSource`, `ContentPreviewTracker`, `setup_content_gallery_ui`, `BootstrapDemoScene`, `setup_demo_scene`
 
 ## Repo Operations
 
@@ -155,16 +157,16 @@
 
 - **Primary entry points:** `ci`, `ci.ps1`, `ci.cmd`, `ci-local.sh`, `ci-local.ps1`
 - **Alignment target:** `.github/workflows/ci.yml`, with optional local `cargo deny` / `cargo audit` execution when those tools are installed
-- **Current usage model:** use the stable `ci` dispatcher first, run `lint` on the host that owns the relevant `cfg(target_os)` code path, then `test`, then `all` for the wider policy suite
-- **Common change risks:** letting local scripts drift from GitHub Actions, treating one host OS as proof for another, forgetting `--locked`, or changing MSRV in `Cargo.toml` without updating scripts and workflows
-- **Search hints:** `MSRV`, `cargo deny`, `cargo audit`, `RUSTDOCFLAGS`
+- **Current usage model:** use the stable `ci` dispatcher first, run `lint` on the host that owns the relevant `cfg(target_os)` code path, run direct `cargo check` / `cargo clippy` target commands when touching `wasm32-unknown-unknown`, `aarch64-linux-android`, or `aarch64-apple-ios`, then `test`, then `all` for the wider policy suite
+- **Common change risks:** letting local scripts drift from GitHub Actions, treating one host OS as proof for another, forgetting `--locked`, leaving non-host targets checked only locally or only on one runner, or changing MSRV in `Cargo.toml` without updating scripts and workflows
+- **Search hints:** `MSRV`, `cargo deny`, `cargo audit`, `RUSTDOCFLAGS`, `wasm32-unknown-unknown`, `aarch64-linux-android`, `aarch64-apple-ios`
 
 ### GitHub Workflows
 
 - **Primary files:** `.github/workflows/ci.yml`, `.github/workflows/audit.yml`, `.github/workflows/dco.yml`
-- **Owns:** automated workspace validation, scheduled security audit, DCO commit-signoff enforcement
+- **Owns:** automated workspace validation, dedicated `wasm32-unknown-unknown` / `aarch64-linux-android` / `aarch64-apple-ios` target validation, scheduled security audit, DCO commit-signoff enforcement
 - **Does not own:** release packaging or crate publishing yet
-- **Common change risks:** adding checks locally without CI parity, leaving platform-gated code covered on only one runner, using unrelated actions, or requiring tools not available on the selected runner
+- **Common change risks:** adding checks locally without CI parity, leaving platform-gated code covered on only one runner or host lane, omitting target installation or SDK/toolchain setup for non-host targets such as `wasm32-unknown-unknown`, `aarch64-linux-android`, or `aarch64-apple-ios`, using unrelated actions, or requiring tools not available on the selected runner
 
 ## Planned But Not Yet Implemented
 
@@ -208,7 +210,7 @@ These matter now even if the downstream crates are not implemented yet.
 | `target/` | build output | do not commit; ignore for repo reasoning |
 | `tests/` | placeholder only (`.gitkeep`) | add real integration tests here when they exist |
 | `assets/` | placeholder only (`.gitkeep`) | add fixtures/samples here when they exist |
-| `docs/design-gap-requests/` | placeholder only (`.gitkeep`) | add local design-gap notes here when needed |
+| `docs/design-gap-requests/` | local design-gap notes | record design/policy gaps here, such as the Remastered `.bk2` support boundary note and the media-container/localization-packaging strategy note |
 | `docs/implementation-notes/` | placeholder only (`.gitkeep`) | add manual verification or local notes here when needed |
 
 ## Evidence Paths
