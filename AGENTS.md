@@ -246,6 +246,137 @@ They are not optional style preferences.
 - Avoid obvious comments like "increment counter". The code already says that.
   Spend comments on context, rationale, and constraints.
 
+### Error Design
+
+- Use a **single shared `Error` enum** in `src/error.rs` for all modules.
+- Every variant must carry **structured fields** (named, not positional) that
+  provide enough context for callers to produce diagnostics without a debugger.
+- Never use stringly-typed errors; prefer `&'static str` context tags over
+  allocated `String`.
+- Implement `Display` so the human-readable message embeds the numeric context
+  (byte counts, offsets, limits).
+
+### Integer Overflow Safety
+
+- Use `saturating_add` (or `checked_add` where recovery is needed) at **every
+  arithmetic boundary** where untrusted input influences the operands —
+  especially `header_size + payload_size`, `offset + size`, and decompression
+  output length calculations.
+- This applies to both parsing paths and lookup/retrieval paths (e.g.
+  `get_by_crc`).
+- Never rely on Rust's debug-mode overflow panics as the safety mechanism;
+  the code must be correct in release mode.
+
+### Safe Indexing — No Direct Indexing in Production Code
+
+Production code must **never** use direct indexing on **any type** —
+`&[u8]`, `&str`, `Vec<T>`, or any other indexable container.  This applies
+regardless of whether the index "feels safe" (e.g. derived from `.find()`
+or bounded by a loop guard).  Direct indexing panics on out-of-bounds
+access, which is a denial-of-service vector.
+
+For **sequential processing**, use iterators, combinators, and transformers
+(`.iter()`, `.map()`, `.filter()`, `.enumerate()`, `.zip()`, `.flat_map()`,
+`.fold()`, etc.) instead of index-based loops. Prefer `.windows()`,
+`.chunks()`, `.split()`, and similar slice iterators over manual index range
+loops. When iterating with an index for bookkeeping, use `.enumerate()`
+rather than a manual counter.
+
+**Banned patterns (all of these panic on OOB):**
+
+```rust
+data[offset]           // byte slice indexing
+data[start..end]       // byte slice range
+line[pos..]            // string slicing
+content[..colon_pos]   // string slicing with find()-derived index
+entries[i].0           // vec/slice element access
+bytes[i]               // byte array indexing
+value.as_bytes()[0]    // first-byte access
+```
+
+**Required replacements:**
+
+| Banned                | Replacement                                            |
+| --------------------- | ------------------------------------------------------ |
+| `data[offset]`        | `read_u8(data, offset)?` or `data.get(offset)`         |
+| `data[start..end]`    | `data.get(start..end).ok_or(Error::…)?`                |
+| `line[pos..]`         | `line.get(pos..).unwrap_or("")`                        |
+| `&line[..pos]`        | `line.get(..pos).unwrap_or(line)`                      |
+| `entries[i]`          | `entries.get(i).map(…)` or `entries.get_mut(i).map(…)` |
+| `bytes[i]`            | `bytes.get(i) == Some(&val)`                           |
+| `value.as_bytes()[0]` | `value.as_bytes().first()`                             |
+
+**Binary parsers** should use the centralised safe-read helpers in
+`src/read.rs`:
+
+- `read_u8(data, offset)` — reads one byte via `.get()`
+- `read_u16_le(data, offset)` — reads two bytes via `.get()`, little-endian
+- `read_u32_le(data, offset)` — reads four bytes via `.get()`, little-endian
+
+All helpers return `Result<_, Error::UnexpectedEof>` with structured context
+(needed offset, available length).  They use `checked_add` internally to
+prevent integer overflow on offset arithmetic.
+
+**Text parsers** should use `.get()` with `.unwrap_or("")` (or
+`.unwrap_or(original)` when the fallback is the unsliced source).
+Even though `str::find()` returns valid UTF-8-aligned indices, the rule
+is absolute — no reviewer should ever need to *reason* about whether an
+index is safe.  If it compiles without `.get()`, it's wrong.
+
+**Test code** (`#[cfg(test)]` blocks) may use direct indexing when the test
+controls the input and panic-on-bug is acceptable.
+
+### No `.unwrap()` in Production Code
+
+Production code must **never** call `.unwrap()`, `.expect()`, or any method
+that panics on `None`/`Err`. Use `?`, `.ok_or()`, `.map_err()`, or
+`.unwrap_or()` instead.
+
+**Test code** may use `.unwrap()` freely — a panic in a test is an acceptable
+failure mode.
+
+### Type Safety — Make Invalid States Unrepresentable
+
+- Use the Rust type system to **prevent invalid, incorrect, or ambiguous
+  states at compile time** rather than guarding against them at runtime.
+- **Enum state machines over boolean flags.** When an object moves through
+  distinct phases (e.g., loading → streaming → ready), model each phase as
+  an enum variant carrying only the data valid for that phase. This makes
+  impossible states (such as "has audio info but hasn't finished loading")
+  structurally unrepresentable.
+- **Newtypes for domain identifiers.** Use newtype wrappers for domain-specific
+  integer identifiers to prevent accidental mixing of semantically different
+  values. The newtype should:
+  - Derive: `Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash`
+  - Provide `from_raw(value) -> Self` and `to_raw(self) -> inner` accessors
+  - Implement `Display` with a human-readable format
+- **Current newtypes:**
+
+  | Type     | Inner | Module | Purpose                        |
+  | -------- | ----- | ------ | ------------------------------ |
+  | `MixCrc` | `u32` | `mix`  | Westwood MIX filename CRC hash |
+
+- When adding new format modules, evaluate whether key identifiers (offsets,
+  indices, hashes) would benefit from newtype wrapping. Apply newtypes where
+  misuse could cause silent data corruption or security issues — not for every
+  integer.
+- **Typestate where appropriate.** When an API has a mandatory call sequence
+  (build → configure → finalize), encode each step as a distinct type so
+  callers cannot skip or reorder steps. In Bevy ECS contexts where a single
+  concrete `Resource` type is required, prefer an internal enum over
+  typestate on the outer type.
+- **`Option` / `Result` over sentinel values.** Never use `-1`, `0`,
+  `""`, or `null`-equivalent magic values to signal absence. Use `Option`
+  or `Result` so the compiler forces callers to handle the missing case.
+- **Visibility and constructor control.** Keep struct fields private and
+  expose transition methods that enforce invariants. If a struct can only
+  be in a valid state when constructed through specific paths, make the
+  invalid construction path impossible rather than documenting "don't do
+  this."
+- **Exhaustive matching.** Prefer `match` over `if let` when handling enums
+  so that adding a new variant produces a compile error at every site that
+  must handle it, rather than silently falling through.
+
 ### Lifetime Naming
 
 - Lifetime parameter names must be meaningful: name the lifetime after the
@@ -259,21 +390,191 @@ They are not optional style preferences.
   borrowed and why. This improves readability and reduces confusion when
   multiple lifetimes are present.
 
-### 3. Test Documentation Standard
+### Parser Design Philosophy
 
-- Tests are part of the permanent design record. They must be readable without
-  reverse-engineering the test body.
-- Every non-trivial `#[test]` should have a `///` doc comment describing:
-  - **what** scenario is being tested
-  - **why** the scenario matters (bug, invariant, boundary, regression, security risk)
-  - **how** the test is constructed when that is not obvious from the code
-- Test names should describe the behavioral contract, not just the function
-  under test.
-- Test helpers must carry the same documentation standard as production code
-  if they encode non-obvious binary layouts, fixtures, determinism setup, or
-  scenario construction.
+- **Parsers are pure functions** of their input (`&[u8]`). No hidden state,
+  no side effects, no filesystem access. Calling a parser twice on the same
+  input must yield identical results.
+- **Permissive on unknown values.** Parsers accept unrecognised enum values
+  (e.g. compression IDs, flags) and store them as-is. Callers decide whether
+  they can handle the value. This supports future and modded game files.
+- **Strict on structural integrity.** Offsets, sizes, and counts must be
+  validated against actual buffer lengths before any slice operation.
 
-### 3a. Test Fixture Legality and CI Portability
+### `std` and Allocation
+
+- The crate uses `std`. Use standard library types (`Vec`, `String`, `HashMap`)
+  as appropriate.
+- The `&[u8]` parsing API remains the primary interface (callers provide bytes).
+  Large container formats should also expose reader-based streaming APIs when
+  they materially reduce whole-file memory use.
+
+### Heap Allocation Policy
+
+This crate processes game assets in real-time contexts. Minimise heap
+allocation to reduce allocator overhead, GC pauses, and memory fragmentation.
+
+**Rules (in priority order):**
+
+1. **Hot paths must not heap-allocate.** Any function called per-frame, per-lookup,
+   or per-byte (e.g. `crc()`, LCW command handlers, ADPCM nibble decode) must be
+   zero-allocation. Use stack buffers, byte-by-byte processing, or iterator
+   patterns instead of `String`, `Vec`, or `Box`.
+
+2. **Parsers should borrow, not copy.** When the parsed result can reference the
+   input slice (via `&'a [u8]`), prefer borrowing over `.to_vec()`. This
+   eliminates per-entry allocations during bulk parsing. Example: `ShpFrame<'a>`
+   borrows frame data from the input; `MixArchive<'a>` borrows the data section.
+
+3. **Fixed-size scratch buffers belong on the stack.** When the maximum size is
+   bounded and small (≤ ~4 KB), use a `[T; N]` array instead of `Vec<T>`.
+   Example: BigNum double-width multiplication buffers in `mix_crypt` use
+   `[u32; BN_DOUBLE]` (516 bytes) instead of `vec![0u32; len]`.
+
+4. **`Vec::with_capacity` for necessary allocations.** When a heap allocation
+   is unavoidable (variable-length output like decompressed pixel data), always
+   use `Vec::with_capacity(known_size)` to avoid reallocation.
+
+5. **Prefer bulk operations over per-element loops.**
+   - `Vec::extend_from_slice` over N × `push` for literal copies (memcpy).
+   - `Vec::extend_from_within` over N × indexed-push for non-overlapping
+     back-references (memcpy from self).
+   - `Vec::resize(len + n, value)` over N × `push(value)` for fills (memset).
+   These let the compiler emit SIMD/vectorised memory operations.
+
+6. **`#[inline]` on small hot functions.** Trivial accessors
+   (`from_raw`/`to_raw`, `is_stereo`, `has_embedded_palette`), CRC computation,
+   binary-search lookup (`get`, `get_by_crc`), and the safe-read helpers must
+   carry `#[inline]` to guarantee inlining across crate boundaries.
+
+7. **Release profile optimisation.** `Cargo.toml` specifies `lto = true` and
+   `codegen-units = 1` for release builds, enabling cross-crate inlining and
+   whole-program dead-code elimination.
+
+**Current allocation profile by module:**
+
+| Module      | Parse-time allocs       | Runtime allocs       | Notes                       |
+| ----------- | ----------------------- | -------------------- | --------------------------- |
+| `mix`       | 1 (entry Vec)           | 0 per lookup         | `crc()` is zero-alloc       |
+| `pal`       | 0                       | 0                    | Fixed `[PalColor; 256]`     |
+| `shp`       | 2 (offset + frame Vecs) | 1 per `pixels()`     | Frame data borrows input    |
+| `aud`       | 0 (borrows input)       | 1 per `decode_adpcm` | With-capacity Vec           |
+| `lcw`       | 1 (output Vec)          | —                    | With-capacity, bulk ops     |
+| `mix_crypt` | 1 (decrypt output)      | 0 in RSA loop        | BigNum is stack `[u32; 64]` |
+| `tmp`       | 1 (tile Vec)            | 0                    | Tile data borrows input     |
+| `vqa`       | 2 (chunk + frame Vecs)  | 0                    | Chunk data borrows input    |
+| `wsa`       | 2 (offset + frame Vecs) | 0                    | Frame data borrows input    |
+| `fnt`       | 1 (glyph Vec)           | 0                    | Glyph data borrows input    |
+| `ini`       | 3 (HashMap + 2 Vecs)    | 0                    | String allocs per entry     |
+| `miniyaml`  | N (node tree)           | 0                    | String allocs per node      |
+| `cps`       | 1 (output Vec)          | 0                    | LCW decompress or raw copy  |
+| `shp_ts`    | 2 (offset + frame Vecs) | 1 per `pixels()`    | Frame data borrows input    |
+| `vxl`       | 3 (headers + tailers)   | 0                    | Body data borrows input     |
+| `hva`       | 2 (names + transforms)  | 0                    | Float data parsed into Vec  |
+| `w3d`       | N (chunk tree)          | 0                    | Leaf data borrows input     |
+| `csf`       | N (category + strings)  | 0                    | String data parsed into Vec |
+
+### Implementation Comments (What / Why / How)
+
+A reviewer should be able to learn and understand the entire design by reading
+the source alone — without consulting external documentation, git history, or
+the original author.
+
+Every non-trivial block of implementation code must carry comments that answer
+up to three questions:
+
+1. **What** — what this code does (one-line summary above the block or method).
+2. **Why** — the design decision, security invariant, or domain rationale that
+   motivated this approach over alternatives.
+3. **How** (when non-obvious) — algorithm steps, bit-level encoding, reference
+   to the original format spec or EA source file name.
+
+Specific guidance:
+
+- **Constants and magic numbers:** document the origin and meaning.  If a
+  constant derives from a V38 security cap, say so.  If it mirrors a value
+  from the original game binary, name the source file.
+- **Section headers:** use `// ── Section name ───…` comment bars to visually
+  separate logical phases within a long function (e.g. header parsing, offset
+  table, frame extraction).
+- **Safety-critical paths:** every V38 guard (ratio cap, output limit,
+  bounds check, forward-progress assertion) must have an inline comment
+  explaining *what* it prevents and *why* the chosen limit is correct.
+- **Algorithm steps:** multi-step algorithms (LCW commands, IMA ADPCM nibble
+  decode, CRC accumulation) should have per-step inline comments so a reader
+  can follow the logic without cross-referencing an external spec.
+- **Permissive vs. strict:** where the parser intentionally accepts values it
+  doesn't recognise (unknown compression IDs, out-of-range palette bytes),
+  comment that the permissiveness is deliberate and why.
+
+This standard applies equally to production code and test helpers (e.g.
+`build_shp`, `build_aud`).  The same what/why/how structure used for `#[test]`
+doc comments (see Testing Standards below) applies to implementation code via
+`///` doc comments on public items and `//` inline comments on internal logic.
+
+### 3. Testing Standards
+
+#### Test Documentation
+
+Every `#[test]` function must have a `///` doc comment with up to three
+paragraphs:
+
+1. **What** (first line) — the scenario being tested.
+2. **Why** (second paragraph) — the security invariant, correctness guarantee,
+   or edge-case rationale that motivates the test.
+3. **How** (optional third paragraph) — non-obvious test construction details
+   (byte encoding, overflow mechanics, manual binary layout).
+
+Omit the "How" paragraph when the test body is self-explanatory.
+
+Test names should describe the behavioral contract, not just the function
+under test. Test helpers must carry the same documentation standard as
+production code if they encode non-obvious binary layouts, fixtures,
+determinism setup, or scenario construction.
+
+#### Doc Examples Must Compile and Pass
+
+All `///` and `//!` code examples (doctests) must compile, run, and pass.
+Never use `no_run`, `ignore`, or `compile_fail` annotations to skip execution.
+If a code example requires filesystem access, network, or other unavailable
+resources, rewrite it to use in-memory data so it runs in CI without external
+dependencies.
+
+#### Test Organisation
+
+Tests within each module are grouped under section-comment headers:
+
+```rust
+// ── Category name ────────────────────────────────────────────────────
+```
+
+Standard categories (in order): basic functionality, error field & Display
+verification, known-value cross-validation, determinism, boundary tests,
+integer overflow safety, security edge-case tests.
+
+#### Required Test Categories
+
+Every parser module must include tests for:
+
+- **Happy path:** parse well-formed input, verify fields.
+- **Error paths:** each `Error` variant the module can return must be tested,
+  including verification that structured fields carry correct values.
+- **Display messages:** at least one test asserting `Error::Display` output
+  contains the key numeric values.
+- **Determinism:** parse (or decode) the same input twice, assert equality.
+- **Boundary:** test both sides of every limit (exactly at cap succeeds,
+  one past cap fails; minimum valid input succeeds, one byte short fails).
+- **Overflow safety:** craft inputs with `u32::MAX` or near-max values to
+  exercise `saturating_add` / bounds-check paths; assert no panic and
+  correct error return.
+
+#### Security Testing (V38)
+
+Every parser module must include **adversarial** tests that exercise the V38
+safety invariants with crafted malicious inputs.  These tests ensure that
+future changes do not regress the security guarantees.
+
+#### Test Fixture Legality and CI Portability
 
 - Never commit proprietary, copyrighted, or otherwise redistribution-restricted
   game assets to this repository unless there is a clearly documented license

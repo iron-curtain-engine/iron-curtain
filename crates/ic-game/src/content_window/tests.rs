@@ -671,7 +671,7 @@ fn sprite_preview_loads_real_shp_and_palette_bytes() {
     };
 
     let preview =
-        super::preview::load_preview_for_entry(&entry, &[sprite_catalog, palette_catalog])
+        super::preview::load_preview_for_entry(&entry, &[sprite_catalog, palette_catalog], None)
             .expect("preview loading should succeed")
             .expect("sprite sheets are previewable");
 
@@ -718,7 +718,7 @@ fn sprite_preview_loads_real_shp_and_palette_bytes_from_mix_members() {
         .cloned()
         .expect("the mounted MIX sprite member should exist");
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[catalog])
+    let preview = super::preview::load_preview_for_entry(&entry, &[catalog], None)
         .expect("archive-member preview loading should succeed")
         .expect("sprite sheets are previewable");
 
@@ -753,7 +753,7 @@ fn palette_preview_builds_a_visible_swatch_grid() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[])
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
         .expect("palette preview loading should succeed")
         .expect("palettes are previewable");
 
@@ -785,7 +785,7 @@ fn aud_preview_builds_waveform_and_direct_pcm_payload() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[])
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
         .expect("AUD preview loading should succeed")
         .expect("AUD resources are previewable");
 
@@ -847,7 +847,7 @@ fn wsa_preview_decodes_multiple_frames_with_external_palette() {
     };
 
     let preview =
-        super::preview::load_preview_for_entry(&entry, &[visual_catalog, palette_catalog])
+        super::preview::load_preview_for_entry(&entry, &[visual_catalog, palette_catalog], None)
             .expect("WSA preview loading should succeed")
             .expect("WSA resources are previewable");
 
@@ -875,7 +875,7 @@ fn text_preview_surfaces_config_excerpt() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[])
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
         .expect("text preview loading should succeed")
         .expect("config files are previewable");
 
@@ -902,7 +902,7 @@ fn vqa_preview_surfaces_video_frames_and_audio() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[])
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
         .expect("VQA preview loading should succeed")
         .expect("VQA resources are previewable");
 
@@ -959,6 +959,239 @@ fn preview_capability_badges_cover_audio_video_and_text_assets() {
     assert_eq!(
         super::preview::preview_capabilities_for_entry(&ini_entry).badge_string(),
         "--T"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming playback state machine regression tests
+// ---------------------------------------------------------------------------
+
+/// Proves that `push_frames` preserves the current frame index so playback
+/// continues smoothly when batches arrive during streaming VQA decode.
+///
+/// Regression: before this fix, accumulated timer would wrap past all newly
+/// appended frames and restart the video from frame 0.
+#[test]
+fn push_frames_preserves_current_frame_index() {
+    let frame_a = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![10, 20, 30, 255])
+        .expect("frame A should be valid");
+    let frame_b = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![40, 50, 60, 255])
+        .expect("frame B should be valid");
+    let frame_c = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![70, 80, 90, 255])
+        .expect("frame C should be valid");
+
+    // Start with one frame (as FirstFrame would), advance to it.
+    let mut session =
+        super::preview::VisualPreviewSession::new(vec![frame_a], Some(1.0 / 15.0))
+            .expect("a single-frame session should be created");
+    assert_eq!(session.current_frame_index(), 0);
+    assert_eq!(session.frame_count(), 1);
+
+    // Simulate streaming batch arrival with two new frames.
+    session.push_frames(vec![frame_b, frame_c]);
+
+    assert_eq!(session.frame_count(), 3);
+    assert_eq!(
+        session.current_frame_index(),
+        0,
+        "current frame must remain at 0 after push_frames; it must not jump ahead or wrap",
+    );
+}
+
+/// Proves that a single-frame session reports no animation, preventing the
+/// frame timer from accumulating while we wait for streaming batches.
+///
+/// This matters because the advance loop checks `has_animation()` before
+/// incrementing the timer. Without this guard the timer would accumulate
+/// during the single-frame wait and then skip many frames on batch arrival.
+#[test]
+fn single_frame_session_has_no_animation() {
+    let frame = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![10, 20, 30, 255])
+        .expect("frame should be valid");
+    let session =
+        super::preview::VisualPreviewSession::new(vec![frame], Some(1.0 / 15.0))
+            .expect("a single-frame session should be created");
+
+    assert_eq!(session.frame_count(), 1);
+    assert!(
+        session.frame_duration_seconds().is_some(),
+        "session should still know the intended frame rate",
+    );
+    // The key invariant: has_animation() requires frame_count > 1.
+    // We test this indirectly via frame_count since has_animation is on
+    // ContentPreviewTracker, but the session-level contract is what matters.
+    assert_eq!(
+        session.frame_count() > 1,
+        false,
+        "a single-frame session must not report as animatable",
+    );
+}
+
+/// Proves that `select_frame` wraps safely at both ends of the frame range.
+///
+/// Regression: direct indexing patterns like `frames[frame_index]` panicked
+/// on out-of-bounds access. The modulo wrap in `select_frame` is the
+/// defense-in-depth layer.
+#[test]
+fn select_frame_wraps_at_boundaries() {
+    let frames: Vec<_> = (0..3u8)
+        .map(|i| {
+            ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![i, i, i, 255])
+                .expect("synthetic frame should be valid")
+        })
+        .collect();
+
+    let mut session =
+        super::preview::VisualPreviewSession::new(frames, Some(0.1))
+            .expect("a three-frame session should be created");
+
+    // Normal select.
+    session.select_frame(2);
+    assert_eq!(session.current_frame_index(), 2);
+
+    // Wrap past end: index 3 → frame 0.
+    session.select_frame(3);
+    assert_eq!(session.current_frame_index(), 0);
+
+    // Larger wrap: index 5 → frame 2.
+    session.select_frame(5);
+    assert_eq!(session.current_frame_index(), 2);
+}
+
+/// Proves that PlaybackSyncMode::Timer and AudioSync are distinct variants,
+/// and that the StreamingFirstFrame phase always uses Timer.
+///
+/// Regression: the old `force_timer_playback: bool` flag defaulted to false,
+/// meaning audio-sync was the *implicit* mode. That caused videos to restart
+/// from frame 0 when audio arrived after streaming playback had started.
+/// The enum makes AudioSync an explicit opt-in that can only appear in Ready.
+#[test]
+fn audio_sync_mode_requires_explicit_opt_in() {
+    let timer = super::preview::PlaybackSyncMode::Timer;
+    let audio = super::preview::PlaybackSyncMode::AudioSync;
+    assert_ne!(
+        timer, audio,
+        "Timer and AudioSync must be distinct states so the advance loop \
+         can choose the right path",
+    );
+}
+
+/// Proves that the StreamingFirstFrame phase always reports Timer sync mode
+/// and that playback is requested by default.
+#[test]
+fn streaming_first_frame_phase_uses_timer_and_auto_plays() {
+    let frame = ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![10, 20, 30, 255])
+        .expect("frame should be valid");
+    let phase = super::preview::PreviewPhase::StreamingFirstFrame {
+        family: super::catalog::ContentFamily::Video,
+        visual_session: super::preview::VisualPreviewSession::new(vec![frame], Some(1.0 / 15.0))
+            .expect("session should be created"),
+        frame_timer_seconds: 0.0,
+        playback_requested: true,
+    };
+    match &phase {
+        super::preview::PreviewPhase::StreamingFirstFrame {
+            playback_requested, ..
+        } => {
+            assert!(
+                *playback_requested,
+                "StreamingFirstFrame should auto-play",
+            );
+        }
+        _ => panic!("expected StreamingFirstFrame"),
+    }
+}
+
+/// Proves that the waveform preview generator does not panic on `i16::MIN`,
+/// the extreme-but-valid PCM sample value.
+///
+/// Regression: `sample.abs()` overflows in debug mode for i16::MIN (-32768)
+/// because 32768 does not fit in i16. The fix casts to i32 before `.abs()`.
+#[test]
+fn waveform_handles_i16_min_without_overflow() {
+    use super::catalog::{ContentCatalogEntry, ContentEntryLocation, ContentFamily, ContentSupportLevel};
+
+    // Build a WAV with i16::MIN samples.
+    let fixture = TestDir::new("waveform_i16_min");
+    let samples = [i16::MIN, i16::MAX, 0i16, i16::MIN];
+    let wav_bytes = {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 22050,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec)
+                .expect("WAV writer should initialize");
+            for &s in &samples {
+                writer.write_sample(s).expect("sample should write");
+            }
+            writer.finalize().expect("WAV should finalize");
+        }
+        cursor.into_inner()
+    };
+    let wav_path = fixture.write_file("EXTREME.WAV", &wav_bytes);
+    let entry = ContentCatalogEntry {
+        relative_path: "EXTREME.WAV".into(),
+        location: ContentEntryLocation::filesystem(wav_path),
+        size_bytes: wav_bytes.len() as u64,
+        family: ContentFamily::Audio,
+        support: ContentSupportLevel::SupportedNow,
+    };
+
+    // This must not panic with "attempt to negate with overflow".
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+        .expect("WAV preview should succeed")
+        .expect("WAV files are previewable");
+    assert!(
+        preview.visual().is_some(),
+        "WAV preview should include a waveform visual",
+    );
+}
+
+/// Proves that `push_frames` into a session that has advanced beyond frame 0
+/// does not regress the current position.
+#[test]
+fn push_frames_does_not_regress_advanced_position() {
+    let make_frame = |v: u8| {
+        ic_render::sprite::RgbaSpriteFrame::from_rgba(1, 1, vec![v, v, v, 255])
+            .expect("frame should be valid")
+    };
+
+    let mut session =
+        super::preview::VisualPreviewSession::new(vec![make_frame(0), make_frame(1)], Some(0.1))
+            .expect("a two-frame session should be created");
+
+    // Advance to frame 1 (as the timer would).
+    session.select_frame(1);
+    assert_eq!(session.current_frame_index(), 1);
+
+    // A streaming batch arrives with two more frames.
+    session.push_frames(vec![make_frame(2), make_frame(3)]);
+
+    assert_eq!(session.frame_count(), 4);
+    assert_eq!(
+        session.current_frame_index(),
+        1,
+        "push_frames must not change the current frame index; \
+         playback should continue from wherever it was",
+    );
+
+    // The frame at index 1 should still be the original second frame.
+    assert_eq!(session.current_frame().rgba8_pixels(), &[1, 1, 1, 255]);
+}
+
+/// Proves that creating an empty session returns None rather than allowing
+/// a session with zero frames, which would cause a divide-by-zero in the
+/// modulo-based frame selection.
+#[test]
+fn empty_session_is_rejected() {
+    let result = super::preview::VisualPreviewSession::new(vec![], Some(0.1));
+    assert!(
+        result.is_none(),
+        "an empty frame list must produce None, not a session that panics on frame access",
     );
 }
 

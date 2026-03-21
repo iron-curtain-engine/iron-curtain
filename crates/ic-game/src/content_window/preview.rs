@@ -118,12 +118,93 @@ pub(crate) struct ContentPreviewLoadTask {
 /// soon as the initial frame is decoded, followed by the full result once all
 /// frames and audio have been prepared.  Non-video resources send only the
 /// `Full` variant.
+/// How frame advancement is synchronized with audio.
+///
+/// Encoding the valid modes as distinct variants prevents the class of
+/// bugs where audio-position sync restarts a video that was already playing
+/// via timer (the exact regression we saw with streaming VQA).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaybackSyncMode {
+    /// Frame advancement is driven by a local wall-clock timer.
+    /// Used for animations without audio, and for streaming VQA where
+    /// audio arrives after playback has already started.
+    Timer,
+    /// Frame advancement tracks the audio sink position so video and
+    /// audio stay aligned.  Only valid when an audio sink is active.
+    AudioSync,
+}
+
+/// Audio metadata carried alongside a ready preview.
+///
+/// This exists as a separate struct so it can only appear inside
+/// `PreviewPhase::Ready`, enforcing the invariant that audio is never
+/// "available" before the preview is fully loaded.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AudioInfo {
+    pub(crate) duration_seconds: f32,
+}
+
+/// The lifecycle phase of the content preview.
+///
+/// Each variant carries exactly the data valid for that phase.  Fields
+/// that are meaningless in a given state simply do not exist on that
+/// variant, making invalid combinations unrepresentable at compile time.
+///
+/// ```text
+///   Empty ──▶ Loading ──▶ StreamingFirstFrame ──▶ Ready
+///                    │                                ▲
+///                    └──── (non-video Full) ──────────┘
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PreviewPhase {
+    /// No content loaded.
+    Empty,
+
+    /// A background decode is in progress.  The content family is known
+    /// (needed for surface-sizing policy) but no visual or audio data
+    /// exists yet.
+    Loading {
+        family: ContentFamily,
+    },
+
+    /// The first decoded frame is on screen and timer-based playback is
+    /// running while the background thread continues decoding.
+    ///
+    /// Invariants enforced by construction:
+    /// - `sync_mode` is always `Timer` (audio has not arrived yet)
+    /// - `playback_requested` starts `true` (auto-play on first frame)
+    StreamingFirstFrame {
+        family: ContentFamily,
+        visual_session: VisualPreviewSession,
+        frame_timer_seconds: f32,
+        playback_requested: bool,
+    },
+
+    /// All frames have been decoded, optionally with audio and text.
+    Ready {
+        family: ContentFamily,
+        visual_session: VisualPreviewSession,
+        frame_timer_seconds: f32,
+        playback_requested: bool,
+        sync_mode: PlaybackSyncMode,
+        audio_info: Option<AudioInfo>,
+        text_available: bool,
+    },
+}
+
+impl Default for PreviewPhase {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
 #[derive(Debug)]
 enum PreviewLoadMessage {
     /// A single decoded first frame, sent immediately so the content lab can
     /// show a visible image while the rest of the video is still decoding.
     FirstFrame {
         selection: (usize, usize),
+        #[allow(dead_code, reason = "carried for diagnostic logging; not consumed by the receiver yet")]
         entry: ContentCatalogEntry,
         preview: Result<Option<PreparedContentPreview>, PreviewLoadError>,
     },
@@ -244,39 +325,28 @@ impl VisualPreviewSession {
 
 /// Tracks the currently active visual/audio preview surfaces.
 ///
-/// This resource lets the content lab coordinate several Bevy mechanisms that
-/// are otherwise independent:
-/// - temporary `Image` assets used by the sprite renderer
-/// - temporary PCM audio assets used by Bevy audio playback
-/// - frame timing and the user's current transport state
-///
-/// Keeping that state in one resource avoids re-decoding preview content every
-/// frame and gives the right-hand diagnostics panel one canonical runtime
-/// status source.
+/// The Bevy-specific asset handles live on the outer struct because they
+/// must be cleaned up regardless of lifecycle phase.  All state-dependent
+/// fields live inside `phase: PreviewPhase`, which enforces that only data
+/// valid for the current phase is accessible.
 #[derive(Resource, Debug, Default)]
 pub(crate) struct ContentPreviewTracker {
+    // --- Bevy handles (state-independent) ---
     current_selection: Option<(usize, usize)>,
     pub(crate) selected_image_entity: Option<Entity>,
     display_image_handle: Option<Handle<Image>>,
-    visual_session: Option<VisualPreviewSession>,
     #[cfg(target_os = "windows")]
     audio_handle: Option<Handle<PcmAudioSource>>,
     #[cfg(target_os = "windows")]
     audio_entity: Option<Entity>,
-    frame_timer_seconds: f32,
-    playback_requested: bool,
-    audio_available: bool,
-    /// When true, video uses timer-based advance instead of audio-position
-    /// sync.  Set for streaming VQA where audio arrives after playback has
-    /// already started — syncing to audio position 0 would restart the video.
-    force_timer_playback: bool,
-    audio_duration_seconds: Option<f32>,
-    text_available: bool,
-    current_family: Option<ContentFamily>,
-    loading: bool,
+
+    // --- State machine ---
+    phase: PreviewPhase,
 }
 
 impl ContentPreviewTracker {
+    // ── Asset cleanup ────────────────────────────────────────────────
+
     #[cfg(target_os = "windows")]
     fn clear_dynamic_assets(
         &mut self,
@@ -289,18 +359,9 @@ impl ContentPreviewTracker {
         if let Some(handle) = self.audio_handle.take() {
             audio_sources.remove(handle.id());
         }
-
         self.audio_entity = None;
         self.selected_image_entity = None;
-        self.visual_session = None;
-        self.frame_timer_seconds = 0.0;
-        self.playback_requested = false;
-        self.audio_available = false;
-        self.force_timer_playback = false;
-        self.audio_duration_seconds = None;
-        self.text_available = false;
-        self.current_family = None;
-        self.loading = false;
+        self.phase = PreviewPhase::Empty;
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -308,50 +369,236 @@ impl ContentPreviewTracker {
         if let Some(handle) = self.display_image_handle.take() {
             images.remove(handle.id());
         }
-
-        self.visual_session = None;
-        self.frame_timer_seconds = 0.0;
-        self.playback_requested = false;
-        self.audio_available = false;
-        self.force_timer_playback = false;
-        self.audio_duration_seconds = None;
-        self.text_available = false;
         self.selected_image_entity = None;
-        self.current_family = None;
-        self.loading = false;
+        self.phase = PreviewPhase::Empty;
+    }
+
+    // ── Phase transitions ────────────────────────────────────────────
+
+    /// Transition: any → Loading.
+    fn begin_loading(&mut self, family: ContentFamily) {
+        self.phase = PreviewPhase::Loading { family };
+    }
+
+    /// Transition: Loading → StreamingFirstFrame.
+    fn begin_streaming(&mut self, visual_session: VisualPreviewSession) {
+        let family = self.phase_family()
+            .expect("begin_streaming requires a phase with a known family");
+        self.phase = PreviewPhase::StreamingFirstFrame {
+            family,
+            visual_session,
+            frame_timer_seconds: 0.0,
+            playback_requested: true,
+        };
+    }
+
+    /// Append frames to the streaming session.
+    ///
+    /// Only valid in `StreamingFirstFrame`.  The type system guarantees
+    /// that `push_frames` on `VisualPreviewSession` is unreachable from
+    /// `Ready` — only `finalize_streaming` can produce the transition.
+    fn push_streaming_frames(
+        &mut self,
+        frames: Vec<ic_render::sprite::RgbaSpriteFrame>,
+    ) {
+        match &mut self.phase {
+            PreviewPhase::StreamingFirstFrame { visual_session, .. } => {
+                visual_session.push_frames(frames);
+            }
+            _ => {}
+        }
+    }
+
+    /// Transition: StreamingFirstFrame → Ready.
+    ///
+    /// Preserves the current frame position and timer so playback
+    /// continues without a visible skip.
+    fn finalize_streaming(
+        &mut self,
+        audio_info: Option<AudioInfo>,
+    ) {
+        let old = std::mem::take(&mut self.phase);
+        match old {
+            PreviewPhase::StreamingFirstFrame {
+                family,
+                visual_session,
+                frame_timer_seconds,
+                playback_requested,
+            } => {
+                // Streaming always used Timer; keep it even after audio
+                // arrives to avoid jumping back to frame 0.
+                self.phase = PreviewPhase::Ready {
+                    family,
+                    visual_session,
+                    frame_timer_seconds,
+                    playback_requested,
+                    sync_mode: PlaybackSyncMode::Timer,
+                    audio_info,
+                    text_available: false,
+                };
+            }
+            other => {
+                // Not in the expected state — restore and ignore.
+                self.phase = other;
+            }
+        }
+    }
+
+    /// Transition: any → Ready (non-streaming immediate decode).
+    fn apply_ready(
+        &mut self,
+        family: ContentFamily,
+        visual_session: VisualPreviewSession,
+        playback_requested: bool,
+        sync_mode: PlaybackSyncMode,
+        audio_info: Option<AudioInfo>,
+        text_available: bool,
+    ) {
+        self.phase = PreviewPhase::Ready {
+            family,
+            visual_session,
+            frame_timer_seconds: 0.0,
+            playback_requested,
+            sync_mode,
+            audio_info,
+            text_available,
+        };
+    }
+
+    /// Transition: StreamingFirstFrame → Ready via full-decode upgrade.
+    fn upgrade_to_ready(
+        &mut self,
+        visual_session: VisualPreviewSession,
+        audio_info: Option<AudioInfo>,
+        text_available: bool,
+    ) {
+        let family = self.phase_family()
+            .expect("upgrade_to_ready requires a phase with a known family");
+        let sync_mode = if audio_info.is_some() {
+            PlaybackSyncMode::AudioSync
+        } else {
+            PlaybackSyncMode::Timer
+        };
+        self.phase = PreviewPhase::Ready {
+            family,
+            visual_session,
+            frame_timer_seconds: 0.0,
+            playback_requested: true,
+            sync_mode,
+            audio_info,
+            text_available,
+        };
+    }
+
+    // ── Phase queries ────────────────────────────────────────────────
+
+    fn phase_family(&self) -> Option<ContentFamily> {
+        match &self.phase {
+            PreviewPhase::Empty => None,
+            PreviewPhase::Loading { family, .. }
+            | PreviewPhase::StreamingFirstFrame { family, .. }
+            | PreviewPhase::Ready { family, .. } => Some(*family),
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        matches!(
+            self.phase,
+            PreviewPhase::Loading { .. } | PreviewPhase::StreamingFirstFrame { .. }
+        )
+    }
+
+    fn visual_session(&self) -> Option<&VisualPreviewSession> {
+        match &self.phase {
+            PreviewPhase::StreamingFirstFrame { visual_session, .. }
+            | PreviewPhase::Ready { visual_session, .. } => Some(visual_session),
+            _ => None,
+        }
+    }
+
+    fn visual_session_mut(&mut self) -> Option<&mut VisualPreviewSession> {
+        match &mut self.phase {
+            PreviewPhase::StreamingFirstFrame { visual_session, .. }
+            | PreviewPhase::Ready { visual_session, .. } => Some(visual_session),
+            _ => None,
+        }
     }
 
     fn has_visual(&self) -> bool {
-        self.visual_session.is_some() && self.display_image_handle.is_some()
+        self.visual_session().is_some() && self.display_image_handle.is_some()
     }
 
     fn has_animation(&self) -> bool {
-        self.visual_session.as_ref().is_some_and(|session| {
+        self.visual_session().is_some_and(|session| {
             session.frame_count() > 1 && session.frame_duration_seconds().is_some()
         })
     }
 
     fn has_audio(&self) -> bool {
-        self.audio_available
+        matches!(self.phase, PreviewPhase::Ready { audio_info: Some(_), .. })
     }
 
     fn has_text(&self) -> bool {
-        self.text_available
+        matches!(self.phase, PreviewPhase::Ready { text_available: true, .. })
     }
 
     fn has_transport(&self) -> bool {
         self.has_animation() || self.has_audio()
     }
 
+    fn playback_requested(&self) -> bool {
+        match &self.phase {
+            PreviewPhase::StreamingFirstFrame { playback_requested, .. }
+            | PreviewPhase::Ready { playback_requested, .. } => *playback_requested,
+            _ => false,
+        }
+    }
+
+    fn set_playback_requested(&mut self, value: bool) {
+        match &mut self.phase {
+            PreviewPhase::StreamingFirstFrame { playback_requested, .. }
+            | PreviewPhase::Ready { playback_requested, .. } => {
+                *playback_requested = value;
+            }
+            _ => {}
+        }
+    }
+
+    fn toggle_playback(&mut self) {
+        let current = self.playback_requested();
+        self.set_playback_requested(!current);
+    }
+
+    fn sync_mode(&self) -> PlaybackSyncMode {
+        match &self.phase {
+            PreviewPhase::StreamingFirstFrame { .. } => PlaybackSyncMode::Timer,
+            PreviewPhase::Ready { sync_mode, .. } => *sync_mode,
+            _ => PlaybackSyncMode::Timer,
+        }
+    }
+
+    fn frame_timer_seconds_mut(&mut self) -> Option<&mut f32> {
+        match &mut self.phase {
+            PreviewPhase::StreamingFirstFrame { frame_timer_seconds, .. }
+            | PreviewPhase::Ready { frame_timer_seconds, .. } => Some(frame_timer_seconds),
+            _ => None,
+        }
+    }
+
+    fn audio_info(&self) -> Option<&AudioInfo> {
+        match &self.phase {
+            PreviewPhase::Ready { audio_info, .. } => audio_info.as_ref(),
+            _ => None,
+        }
+    }
+
     fn frame_count(&self) -> usize {
-        self.visual_session
-            .as_ref()
+        self.visual_session()
             .map_or(0, VisualPreviewSession::frame_count)
     }
 
     fn current_frame_index(&self) -> usize {
-        self.visual_session
-            .as_ref()
+        self.visual_session()
             .map_or(0, VisualPreviewSession::current_frame_index)
     }
 
@@ -360,36 +607,35 @@ impl ContentPreviewTracker {
     }
 
     fn current_visual_frame(&self) -> Option<&ic_render::sprite::RgbaSpriteFrame> {
-        self.visual_session
-            .as_ref()
+        self.visual_session()
             .map(VisualPreviewSession::current_frame)
     }
 
     pub(crate) fn frame_dimensions(&self) -> Option<(u32, u32)> {
-        self.visual_session
-            .as_ref()
+        self.visual_session()
             .map(VisualPreviewSession::current_frame_dimensions)
     }
 
     fn current_family(&self) -> Option<ContentFamily> {
-        self.current_family
+        self.phase_family()
     }
 
     fn frame_duration_seconds(&self) -> Option<f32> {
-        self.visual_session
-            .as_ref()
+        self.visual_session()
             .and_then(VisualPreviewSession::frame_duration_seconds)
     }
 
     fn select_frame(&mut self, frame_index: usize) {
-        if let Some(session) = &mut self.visual_session {
+        if let Some(session) = self.visual_session_mut() {
             session.select_frame(frame_index);
         }
     }
 
+    // ── Runtime diagnostics ──────────────────────────────────────────
+
     #[cfg(target_os = "windows")]
     fn runtime_status(&self, audio_sink: Option<&AudioSink>) -> String {
-        if self.loading {
+        if self.is_loading() && !self.has_visual() {
             return "preview: loading in background\naudio: waiting for decoded preview\ntransport: unavailable during preparation".into();
         }
 
@@ -398,11 +644,7 @@ impl ContentPreviewTracker {
         if self.has_visual() {
             if let Some((width, height)) = self.frame_dimensions() {
                 if self.has_animation() {
-                    let state = if self.playback_requested {
-                        "playing"
-                    } else {
-                        "paused"
-                    };
+                    let state = if self.playback_requested() { "playing" } else { "paused" };
                     lines.push(format!(
                         "visual: {state} | frame {}/{} | {}x{}",
                         self.current_frame_index() + 1,
@@ -414,7 +656,7 @@ impl ContentPreviewTracker {
                     lines.push(format!("visual: static | 1 frame | {}x{}", width, height));
                 }
             }
-            if let Some(session) = &self.visual_session {
+            if let Some(session) = self.visual_session() {
                 lines.push(session.runtime_summary());
             }
         } else {
@@ -424,12 +666,8 @@ impl ContentPreviewTracker {
         if self.has_audio() {
             match audio_sink {
                 Some(sink) => {
-                    let state = if sink.is_paused() {
-                        "paused"
-                    } else {
-                        "playing"
-                    };
-                    let total = self.audio_duration_seconds.unwrap_or_default();
+                    let state = if sink.is_paused() { "paused" } else { "playing" };
+                    let total = self.audio_info().map_or(0.0, |a| a.duration_seconds);
                     lines.push(format!(
                         "audio: {state} | {:.2}s / {:.2}s",
                         sink.position().as_secs_f32(),
@@ -451,11 +689,7 @@ impl ContentPreviewTracker {
         if self.has_transport() {
             lines.push(format!(
                 "transport: {}",
-                if self.playback_requested {
-                    "running"
-                } else {
-                    "paused"
-                }
+                if self.playback_requested() { "running" } else { "paused" }
             ));
         } else {
             lines.push("transport: not applicable".into());
@@ -466,7 +700,7 @@ impl ContentPreviewTracker {
 
     #[cfg(not(target_os = "windows"))]
     fn runtime_status(&self) -> String {
-        if self.loading {
+        if self.is_loading() && !self.has_visual() {
             return "preview: loading in background\naudio: waiting for decoded preview\ntransport: unavailable during preparation".into();
         }
 
@@ -475,11 +709,7 @@ impl ContentPreviewTracker {
         if self.has_visual() {
             if let Some((width, height)) = self.frame_dimensions() {
                 if self.has_animation() {
-                    let state = if self.playback_requested {
-                        "playing"
-                    } else {
-                        "paused"
-                    };
+                    let state = if self.playback_requested() { "playing" } else { "paused" };
                     lines.push(format!(
                         "visual: {state} | frame {}/{} | {}x{}",
                         self.current_frame_index() + 1,
@@ -491,7 +721,7 @@ impl ContentPreviewTracker {
                     lines.push(format!("visual: static | 1 frame | {}x{}", width, height));
                 }
             }
-            if let Some(session) = &self.visual_session {
+            if let Some(session) = self.visual_session() {
                 lines.push(session.runtime_summary());
             }
         } else {
@@ -515,11 +745,7 @@ impl ContentPreviewTracker {
         if self.has_transport() {
             lines.push(format!(
                 "transport: {}",
-                if self.playback_requested {
-                    "running"
-                } else {
-                    "paused"
-                }
+                if self.playback_requested() { "running" } else { "paused" }
             ));
         } else {
             lines.push("transport: not applicable".into());
@@ -605,10 +831,8 @@ pub(crate) fn refresh_content_preview(
         state.set_playback_summary("No active preview runtime.");
         return;
     };
-    tracker.current_family = Some(entry.family);
-
     if should_background_load_preview_for_family(entry.family) {
-        tracker.loading = true;
+        tracker.begin_loading(entry.family);
         state.set_preview_summary(format!(
             "Loading preview for {}...\nFirst frame will appear momentarily while remaining frames decode in the background.",
             entry.relative_path
@@ -678,7 +902,7 @@ pub(crate) fn poll_content_preview_load(
     };
 
     let Ok(receiver) = task.receiver.lock() else {
-        tracker.loading = false;
+        tracker.phase = PreviewPhase::Empty;
         state.set_preview_summary(
             "Background preview preparation failed because the preview receiver could not be locked.",
         );
@@ -690,31 +914,29 @@ pub(crate) fn poll_content_preview_load(
     match receiver.try_recv() {
         Ok(PreviewLoadMessage::FirstFrame {
             selection,
-            entry,
+            entry: _,
             preview,
         }) => {
             if tracker.current_selection != Some(selection) {
                 return;
             }
-            if let Ok(Some(preview)) = apply_prepared_preview(
-                &entry,
-                preview,
-                &mut commands,
-                &mut images,
-                #[cfg(target_os = "windows")]
-                &mut audio_sources,
-                &mut tracker,
-            ) {
+            // Build the visual session from the first frame and seed the
+            // display image, but do NOT call apply_ready — we use
+            // begin_streaming to enter the StreamingFirstFrame phase.
+            if let Ok(Some(preview)) = &preview {
+                if let Some(visual) = preview.visual().cloned() {
+                    if let Some(session) = VisualPreviewSession::new(
+                        visual.frames().to_vec(),
+                        visual.frame_duration_seconds(),
+                    ) {
+                        let initial_frame = session.current_frame();
+                        tracker.display_image_handle =
+                            Some(images.add(rgba_frame_to_image(initial_frame)));
+                        tracker.begin_streaming(session);
+                    }
+                }
                 state.set_preview_summary(preview.summary_text());
             }
-            // Start playback immediately — don't wait for all frames.
-            // Streaming batches will append more frames as they arrive.
-            tracker.playback_requested = true;
-            // Audio arrives later; use timer-based advance so the video
-            // doesn't jump back to frame 0 when audio-sync kicks in.
-            tracker.force_timer_playback = true;
-            // Keep loading — streaming batches follow.
-            tracker.loading = true;
         }
         Ok(PreviewLoadMessage::Full {
             selection,
@@ -726,11 +948,9 @@ pub(crate) fn poll_content_preview_load(
                 return;
             }
 
-            tracker.loading = false;
-
             // If a first-frame session already exists, upgrade it in place so
             // the display surface stays stable.  Otherwise apply from scratch.
-            let result = if tracker.visual_session.is_some() {
+            let result = if tracker.visual_session().is_some() {
                 upgrade_preview_with_full_decode(
                     &entry,
                     preview,
@@ -786,28 +1006,16 @@ pub(crate) fn poll_content_preview_load(
 
             // Append streamed frames to the existing visual session.
             if !batch.frames.is_empty() {
-                if let Some(session) = tracker.visual_session.as_mut() {
-                    session.push_frames(batch.frames);
-                }
+                tracker.push_streaming_frames(batch.frames);
             }
 
-            // When the final batch arrives with audio, create the audio asset
-            // and reset playback to frame 0 so the audio-synced animation
-            // doesn't jump back after timer-based frames have already advanced.
+            // When the final batch arrives, transition to Ready.
             if batch.done {
                 let total_samples = batch.audio_samples.len();
-                if total_samples > 0 {
+                let audio_info = if total_samples > 0 {
                     if let (Some(sample_rate), Some(channels)) =
                         (batch.audio_sample_rate, batch.audio_channels)
                     {
-                        tracker.audio_available = true;
-                        let duration_seconds = if sample_rate > 0 && channels > 0 {
-                            total_samples as f32 / (sample_rate as f32 * channels as f32)
-                        } else {
-                            0.0
-                        };
-                        tracker.audio_duration_seconds = Some(duration_seconds);
-
                         #[cfg(target_os = "windows")]
                         {
                             let pcm = PcmAudioSource::new(
@@ -818,17 +1026,25 @@ pub(crate) fn poll_content_preview_load(
                             tracker.audio_handle = Some(audio_sources.add(pcm));
                             respawn_preview_audio_entity(&mut commands, &mut tracker);
                         }
+                        let duration_seconds = if sample_rate > 0 && channels > 0 {
+                            total_samples as f32 / (sample_rate as f32 * channels as f32)
+                        } else {
+                            0.0
+                        };
+                        Some(AudioInfo { duration_seconds })
+                    } else {
+                        None
                     }
-                }
-                // Audio arrived — do NOT reset to frame 0. Playback already
-                // started on FirstFrame; restarting would cause a visible skip.
-                tracker.loading = false;
+                } else {
+                    None
+                };
+                tracker.finalize_streaming(audio_info);
                 commands.remove_resource::<ContentPreviewLoadTask>();
             }
         }
         Err(mpsc::TryRecvError::Empty) => {}
         Err(mpsc::TryRecvError::Disconnected) => {
-            tracker.loading = false;
+            tracker.phase = PreviewPhase::Empty;
             state.set_preview_summary(
                 "Background preview preparation failed because the worker thread disconnected.",
             );
@@ -856,29 +1072,29 @@ pub(crate) fn handle_content_preview_input(
     }
 
     if keyboard.just_pressed(KeyCode::Space) {
-        tracker.playback_requested = !tracker.playback_requested;
+        tracker.toggle_playback();
     }
 
     if keyboard.just_pressed(KeyCode::Enter) {
-        tracker.playback_requested = true;
+        tracker.set_playback_requested(true);
         tracker.select_frame(0);
-        tracker.frame_timer_seconds = 0.0;
+        if let Some(t) = tracker.frame_timer_seconds_mut() { *t = 0.0; }
         apply_current_preview_frame(&tracker, &mut images, &mut image_query);
         respawn_preview_audio_entity(&mut commands, &mut tracker);
     }
 
     if tracker.has_animation() {
         if keyboard.just_pressed(KeyCode::Comma) {
-            tracker.playback_requested = false;
-            tracker.frame_timer_seconds = 0.0;
+            tracker.set_playback_requested(false);
+            if let Some(t) = tracker.frame_timer_seconds_mut() { *t = 0.0; }
             let previous_frame =
                 (tracker.current_frame_index() + tracker.frame_count() - 1) % tracker.frame_count();
             tracker.select_frame(previous_frame);
             apply_current_preview_frame(&tracker, &mut images, &mut image_query);
         }
         if keyboard.just_pressed(KeyCode::Period) {
-            tracker.playback_requested = false;
-            tracker.frame_timer_seconds = 0.0;
+            tracker.set_playback_requested(false);
+            if let Some(t) = tracker.frame_timer_seconds_mut() { *t = 0.0; }
             let next_frame = (tracker.current_frame_index() + 1) % tracker.frame_count();
             tracker.select_frame(next_frame);
             apply_current_preview_frame(&tracker, &mut images, &mut image_query);
@@ -898,28 +1114,28 @@ pub(crate) fn handle_content_preview_input(
     }
 
     if keyboard.just_pressed(KeyCode::Space) {
-        tracker.playback_requested = !tracker.playback_requested;
+        tracker.toggle_playback();
     }
 
     if keyboard.just_pressed(KeyCode::Enter) {
-        tracker.playback_requested = true;
+        tracker.set_playback_requested(true);
         tracker.select_frame(0);
-        tracker.frame_timer_seconds = 0.0;
+        if let Some(t) = tracker.frame_timer_seconds_mut() { *t = 0.0; }
         apply_current_preview_frame(&tracker, &mut images, &mut image_query);
     }
 
     if tracker.has_animation() {
         if keyboard.just_pressed(KeyCode::Comma) {
-            tracker.playback_requested = false;
-            tracker.frame_timer_seconds = 0.0;
+            tracker.set_playback_requested(false);
+            if let Some(t) = tracker.frame_timer_seconds_mut() { *t = 0.0; }
             let previous_frame =
                 (tracker.current_frame_index() + tracker.frame_count() - 1) % tracker.frame_count();
             tracker.select_frame(previous_frame);
             apply_current_preview_frame(&tracker, &mut images, &mut image_query);
         }
         if keyboard.just_pressed(KeyCode::Period) {
-            tracker.playback_requested = false;
-            tracker.frame_timer_seconds = 0.0;
+            tracker.set_playback_requested(false);
+            if let Some(t) = tracker.frame_timer_seconds_mut() { *t = 0.0; }
             let next_frame = (tracker.current_frame_index() + 1) % tracker.frame_count();
             tracker.select_frame(next_frame);
             apply_current_preview_frame(&tracker, &mut images, &mut image_query);
@@ -942,9 +1158,9 @@ pub(crate) fn sync_content_preview_audio_state(
         return;
     };
 
-    if tracker.playback_requested && sink.is_paused() {
+    if tracker.playback_requested() && sink.is_paused() {
         sink.play();
-    } else if !tracker.playback_requested && !sink.is_paused() {
+    } else if !tracker.playback_requested() && !sink.is_paused() {
         sink.pause();
     }
 }
@@ -968,29 +1184,35 @@ pub(crate) fn advance_content_preview_animation(
     let Some(frame_duration) = tracker.frame_duration_seconds() else {
         return;
     };
-    if !tracker.has_animation() || !tracker.playback_requested {
+    if !tracker.has_animation() || !tracker.playback_requested() {
         return;
     }
 
-    let next_frame = if tracker.has_audio() && !tracker.force_timer_playback {
+    let frame_count = tracker.frame_count();
+    let current = tracker.current_frame_index();
+
+    let next_frame = if tracker.has_audio() && tracker.sync_mode() == PlaybackSyncMode::AudioSync {
         audio_sink_query.single().ok().map(|sink| {
-            let frame_count = tracker.frame_count().max(1);
-            let cycle_seconds = frame_duration * frame_count as f32;
+            let fc = frame_count.max(1);
+            let cycle_seconds = frame_duration * fc as f32;
             let position = sink.position().as_secs_f32();
-            ((position % cycle_seconds) / frame_duration).floor() as usize % frame_count
+            ((position % cycle_seconds) / frame_duration).floor() as usize % fc
         })
     } else {
-        tracker.frame_timer_seconds += time.delta_secs();
-        let mut advanced = tracker.current_frame_index();
-        while tracker.frame_timer_seconds >= frame_duration {
-            tracker.frame_timer_seconds -= frame_duration;
-            advanced = (advanced + 1) % tracker.frame_count();
+        let Some(timer) = tracker.frame_timer_seconds_mut() else {
+            return;
+        };
+        *timer += time.delta_secs();
+        let mut advanced = current;
+        while *timer >= frame_duration {
+            *timer -= frame_duration;
+            advanced = (advanced + 1) % frame_count;
         }
         Some(advanced)
     };
 
     if let Some(next_frame) = next_frame {
-        if tracker.current_frame_index() != next_frame {
+        if current != next_frame {
             tracker.select_frame(next_frame);
             apply_current_preview_frame(&tracker, &mut images, &mut image_query);
         }
@@ -1007,18 +1229,24 @@ pub(crate) fn advance_content_preview_animation(
     let Some(frame_duration) = tracker.frame_duration_seconds() else {
         return;
     };
-    if !tracker.has_animation() || !tracker.playback_requested {
+    if !tracker.has_animation() || !tracker.playback_requested() {
         return;
     }
 
-    tracker.frame_timer_seconds += time.delta_secs();
-    let mut advanced = tracker.current_frame_index();
-    while tracker.frame_timer_seconds >= frame_duration {
-        tracker.frame_timer_seconds -= frame_duration;
-        advanced = (advanced + 1) % tracker.frame_count();
+    let frame_count = tracker.frame_count();
+    let current = tracker.current_frame_index();
+
+    let Some(timer) = tracker.frame_timer_seconds_mut() else {
+        return;
+    };
+    *timer += time.delta_secs();
+    let mut advanced = current;
+    while *timer >= frame_duration {
+        *timer -= frame_duration;
+        advanced = (advanced + 1) % frame_count;
     }
 
-    if tracker.current_frame_index() != advanced {
+    if current != advanced {
         tracker.select_frame(advanced);
         apply_current_preview_frame(&tracker, &mut images, &mut image_query);
     }
@@ -1075,33 +1303,45 @@ fn apply_prepared_preview(
         .and_then(|visual| visual.frame_duration_seconds())
         .is_some();
 
-    tracker.loading = false;
-    tracker.current_family = Some(entry.family);
+    // Build the visual session and seed the display image.
+    let session = preview.visual().cloned().and_then(|visual| {
+        let session =
+            VisualPreviewSession::new(visual.frames().to_vec(), visual.frame_duration_seconds())?;
+        let initial_frame = session.current_frame();
+        tracker.display_image_handle = Some(images.add(rgba_frame_to_image(initial_frame)));
+        Some(session)
+    });
 
-    if let Some(visual) = preview.visual().cloned() {
-        if let Some(session) =
-            VisualPreviewSession::new(visual.frames().to_vec(), visual.frame_duration_seconds())
-        {
-            let initial_frame = session.current_frame();
-            tracker.display_image_handle = Some(images.add(rgba_frame_to_image(initial_frame)));
-            tracker.visual_session = Some(session);
-        }
-    }
-
-    if let Some(audio) = preview.audio() {
-        tracker.audio_available = true;
-        tracker.audio_duration_seconds = Some(audio.duration_seconds());
-
+    // Build audio info and Bevy handles.
+    let audio_info = preview.audio().map(|audio| {
         #[cfg(target_os = "windows")]
         {
             tracker.audio_handle =
                 Some(audio_sources.add(PcmAudioSource::from_preview_audio(audio)));
             respawn_preview_audio_entity(commands, tracker);
         }
-    }
+        AudioInfo {
+            duration_seconds: audio.duration_seconds(),
+        }
+    });
 
-    tracker.text_available = preview.text_body().is_some();
-    tracker.playback_requested = auto_play_visual;
+    let text_available = preview.text_body().is_some();
+    let sync_mode = if audio_info.is_some() && auto_play_visual {
+        PlaybackSyncMode::AudioSync
+    } else {
+        PlaybackSyncMode::Timer
+    };
+
+    if let Some(session) = session {
+        tracker.apply_ready(
+            entry.family,
+            session,
+            auto_play_visual,
+            sync_mode,
+            audio_info,
+            text_available,
+        );
+    }
 
     Ok(Some(preview))
 }
@@ -1115,7 +1355,7 @@ fn apply_prepared_preview(
 /// image handle.  That avoids a visible flicker between the first-frame
 /// preview and the full playback session.
 fn upgrade_preview_with_full_decode(
-    entry: &ContentCatalogEntry,
+    _entry: &ContentCatalogEntry,
     preview: Result<Option<PreparedContentPreview>, PreviewLoadError>,
     commands: &mut Commands,
     #[cfg(target_os = "windows")] audio_sources: &mut Assets<PcmAudioSource>,
@@ -1125,34 +1365,30 @@ fn upgrade_preview_with_full_decode(
         return Ok(None);
     };
 
-    tracker.loading = false;
-    tracker.current_family = Some(entry.family);
+    let session = preview.visual().cloned().and_then(|visual| {
+        VisualPreviewSession::new(visual.frames().to_vec(), visual.frame_duration_seconds())
+    });
 
-    if let Some(visual) = preview.visual().cloned() {
-        if let Some(session) =
-            VisualPreviewSession::new(visual.frames().to_vec(), visual.frame_duration_seconds())
-        {
-            tracker.visual_session = Some(session);
-        }
-    }
-
-    if let Some(audio) = preview.audio() {
-        tracker.audio_available = true;
-        tracker.audio_duration_seconds = Some(audio.duration_seconds());
-
+    let audio_info = preview.audio().map(|audio| {
         #[cfg(target_os = "windows")]
         {
             tracker.audio_handle =
                 Some(audio_sources.add(PcmAudioSource::from_preview_audio(audio)));
             respawn_preview_audio_entity(commands, tracker);
         }
-    }
+        AudioInfo {
+            duration_seconds: audio.duration_seconds(),
+        }
+    });
 
     #[cfg(not(target_os = "windows"))]
     let _ = commands;
 
-    tracker.text_available = preview.text_body().is_some();
-    tracker.playback_requested = true;
+    let text_available = preview.text_body().is_some();
+
+    if let Some(session) = session {
+        tracker.upgrade_to_ready(session, audio_info, text_available);
+    }
 
     Ok(Some(preview))
 }
@@ -1362,7 +1598,7 @@ pub(crate) fn sync_content_preview_billboard(
     // Update loading text visibility — show feedback whenever the main
     // preview area would otherwise be empty/black.
     if let Ok((mut loading_text, mut loading_vis)) = loading_query.single_mut() {
-        let show_loading = if tracker.loading && !tracker.has_visual() {
+        let show_loading = if tracker.is_loading() && !tracker.has_visual() {
             // Actively loading a preview in the background.
             let detail = tracker.current_family().map_or("", |f| match f {
                 ContentFamily::Video => "Decoding video frames",
