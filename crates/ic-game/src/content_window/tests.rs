@@ -331,7 +331,7 @@ fn content_lab_prefers_the_first_previewable_entry_on_startup() {
     );
 }
 
-/// Proves that startup prefers a recognizable showcase asset like `TANYA1.VQA`
+/// Proves that startup prefers a recognizable showcase asset like `ENGLISH.VQA`
 /// when one is present instead of dropping the user onto an arbitrary first
 /// sprite in sorted path order.
 ///
@@ -342,7 +342,7 @@ fn content_lab_prefers_the_first_previewable_entry_on_startup() {
 fn content_lab_prefers_showcase_assets_when_available() {
     let fixture = TestDir::new("content_window_showcase_selection");
     fixture.write_file("CONQUER_OUTPUT/1TNK.SHP", b"shp");
-    fixture.write_file("MOVIES/TANYA1.VQA", b"vqa");
+    fixture.write_file("MOVIES/ENGLISH.VQA", b"vqa");
 
     let source = ContentSourceRoot::directory(
         "Fixture CD",
@@ -358,7 +358,7 @@ fn content_lab_prefers_showcase_assets_when_available() {
             .selected_entry()
             .expect("the showcase entry should be selected")
             .relative_path,
-        "MOVIES/TANYA1.VQA"
+        "MOVIES/ENGLISH.VQA"
     );
 }
 
@@ -368,7 +368,7 @@ fn content_lab_prefers_showcase_assets_when_available() {
 fn replacing_loading_state_with_catalogs_selects_showcase_resource() {
     let fixture = TestDir::new("content_window_replace_catalogs");
     fixture.write_file("CONQUER_OUTPUT/1TNK.SHP", b"shp");
-    fixture.write_file("MOVIES/TANYA1.VQA", b"vqa");
+    fixture.write_file("MOVIES/ENGLISH.VQA", b"vqa");
 
     let source = ContentSourceRoot::directory(
         "Fixture CD",
@@ -386,7 +386,7 @@ fn replacing_loading_state_with_catalogs_selects_showcase_resource() {
             .selected_entry()
             .expect("the showcase entry should be selected after loading")
             .relative_path,
-        "MOVIES/TANYA1.VQA"
+        "MOVIES/ENGLISH.VQA"
     );
 }
 
@@ -1280,6 +1280,176 @@ fn empty_session_is_rejected() {
     assert!(
         result.is_none(),
         "an empty frame list must produce None, not a session that panics on frame access",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for fixes made 2026-03-21
+// ---------------------------------------------------------------------------
+
+/// Proves that SCOMP_SOS=99 AUD files are decoded without the 8-byte SOS
+/// chunk headers being mis-interpreted as ADPCM nibbles.
+///
+/// Regression: `load_aud_preview` called `decode_adpcm` directly on the raw
+/// `compressed_data` slice, which for SOS files contains 8-byte chunk headers
+/// (containing the 0x0000_DEAF magic) interleaved with the ADPCM payload.
+/// `decode_adpcm` treated those header bytes as data and produced noise bursts
+/// throughout the audio.  The fix uses `AudStream::from_payload` which skips
+/// chunk headers before dispatching the ADPCM decoder.
+///
+/// The fixture uses all-zero ADPCM bytes so the expected output is silence
+/// (all-zero samples).  With the old code, the 0xDE and 0xAD bytes of the
+/// chunk magic decoded to large nonzero values, failing both the sample-count
+/// check and the amplitude check below.
+#[test]
+fn aud_scomp_sos_decodes_without_chunk_header_corruption() {
+    // 20 zero ADPCM bytes → 40 decoded samples (each byte = 2 nibbles = 2
+    // samples; IMA nibble 0 with step_index 0 produces diff = 0).
+    const ADPCM_PAYLOAD_BYTES: usize = 20;
+    const EXPECTED_SAMPLES: usize = ADPCM_PAYLOAD_BYTES * 2;
+    const SAMPLE_RATE: u16 = 8000;
+
+    // Manually build a valid SCOMP_SOS=99 AUD file with a single chunk.
+    // SOS chunk header layout: compressed_size (u16) | uncompressed_size (u16)
+    //                          | magic 0x0000_DEAF (u32)
+    let adpcm_payload = vec![0u8; ADPCM_PAYLOAD_BYTES];
+    let chunk_compressed = ADPCM_PAYLOAD_BYTES as u16;
+    // Uncompressed = PCM bytes = samples × 2 bytes/sample (16-bit audio).
+    let chunk_uncompressed = (EXPECTED_SAMPLES * 2) as u16;
+    let total_compressed = (8 + ADPCM_PAYLOAD_BYTES) as u32; // 8-byte SOS header + payload
+    let total_uncompressed = (EXPECTED_SAMPLES * 2) as u32;
+
+    let mut aud_bytes: Vec<u8> = Vec::new();
+    // 12-byte AUD file header.
+    aud_bytes.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    aud_bytes.extend_from_slice(&total_compressed.to_le_bytes());
+    aud_bytes.extend_from_slice(&total_uncompressed.to_le_bytes());
+    aud_bytes.push(0x02); // AUD_FLAG_16BIT
+    aud_bytes.push(99);   // SCOMP_SOS
+    // Single SOS chunk header (8 bytes).
+    aud_bytes.extend_from_slice(&chunk_compressed.to_le_bytes());
+    aud_bytes.extend_from_slice(&chunk_uncompressed.to_le_bytes());
+    aud_bytes.extend_from_slice(&0x0000_DEAF_u32.to_le_bytes());
+    // All-zero ADPCM payload.
+    aud_bytes.extend_from_slice(&adpcm_payload);
+
+    let fixture = TestDir::new("content_window_sos_aud");
+    let aud_path = fixture.write_file("SOUNDS/INTRO.AUD", &aud_bytes);
+    let entry = ContentCatalogEntry {
+        relative_path: "SOUNDS/INTRO.AUD".into(),
+        location: ContentEntryLocation::filesystem(aud_path),
+        size_bytes: aud_bytes.len() as u64,
+        family: ContentFamily::Audio,
+        support: ContentSupportLevel::SupportedNow,
+    };
+
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+        .expect("SCOMP_SOS AUD preview loading should succeed")
+        .expect("AUD resources are previewable");
+
+    let samples = preview
+        .audio_pcm_samples()
+        .expect("SOS AUD preview should expose decoded PCM samples");
+
+    assert_eq!(
+        samples.len(),
+        EXPECTED_SAMPLES,
+        "sample count must equal ADPCM bytes × 2; \
+         extra samples would indicate chunk headers were decoded as ADPCM nibbles",
+    );
+    assert!(
+        samples.iter().all(|&s| s.abs() < 100),
+        "all-zero ADPCM payload must decode to near-silence; \
+         large values mean the 0xDE/0xAD magic bytes were mis-decoded as ADPCM",
+    );
+}
+
+/// Proves that the content-lab window uses `AutoNoVsync` so the swapchain
+/// never times out during heavy background VQA decodes on integrated GPUs.
+///
+/// Regression: the default `AutoVsync` present mode panicked with
+/// `SurfaceError::Timeout` on Intel Xe when a 28 MB VQA took ~2.6 s to decode
+/// because memory-bus saturation prevented the GPU from acquiring the next
+/// frame before the vsync deadline.
+#[test]
+fn content_window_uses_auto_no_vsync_to_prevent_swapchain_timeout() {
+    use bevy::window::PresentMode;
+
+    let display = crate::config::DisplayConfig::default();
+    let window = content_lab_window(&display);
+
+    assert_eq!(
+        window.present_mode,
+        PresentMode::AutoNoVsync,
+        "the content-lab window must use AutoNoVsync so the GPU swapchain \
+         never times out during long background VQA decodes",
+    );
+}
+
+/// Proves that the scanlines overlay is suppressed for non-Video content
+/// families (sprites, palettes, audio, etc.).
+///
+/// Regression: before the family restriction was added, the overlay would
+/// stay visible after navigating away from a VQA to any other resource.
+#[test]
+fn scanlines_should_show_is_false_for_non_video_families() {
+    use super::catalog::ContentFamily;
+    use super::preview::ContentPreviewTracker;
+
+    let families = [
+        ContentFamily::SpriteSheet,
+        ContentFamily::Palette,
+        ContentFamily::Audio,
+        ContentFamily::Config,
+        ContentFamily::WestwoodArchive,
+    ];
+
+    for family in families {
+        let mut tracker = ContentPreviewTracker::default();
+        tracker.test_begin_loading(family);
+
+        let is_video = tracker
+            .test_current_family()
+            .map_or(false, |f| matches!(f, ContentFamily::Video));
+
+        assert!(
+            !is_video,
+            "{family:?} must not be treated as Video; \
+             scanlines would incorrectly remain visible after navigating away from VQA",
+        );
+    }
+}
+
+/// Proves that navigating to a new entry does not destroy the tracker's
+/// reference to the session-persistent scanlines overlay entity.
+///
+/// Regression: `clear_dynamic_assets` (called on every selection change) also
+/// nulled `scanlines_overlay_entity` and `scanlines_overlay_material`.  The
+/// fullscreen overlay is a session-wide entity, not per-entry, so losing its
+/// handle caused a new overlay to spawn on the next VQA while the old one
+/// (still `Visibility::Visible`) remained in the world indefinitely.
+#[test]
+fn scanlines_overlay_entity_persists_across_navigation() {
+    use super::preview::ContentPreviewTracker;
+    use super::catalog::ContentFamily;
+    use bevy::prelude::Entity;
+
+    let mut tracker = ContentPreviewTracker::default();
+
+    // Simulate startup: VQA loaded and overlay spawned by sync_scanlines_overlay.
+    tracker.test_begin_loading(ContentFamily::Video);
+    let overlay_entity = Entity::from_bits(99);
+    tracker.test_set_scanlines_overlay_entity(overlay_entity);
+    assert_eq!(tracker.test_scanlines_overlay_entity(), Some(overlay_entity));
+
+    // Simulate navigation to a new entry (triggers clear_dynamic_assets).
+    tracker.test_clear_for_navigation();
+
+    assert_eq!(
+        tracker.test_scanlines_overlay_entity(),
+        Some(overlay_entity),
+        "the scanlines overlay entity must survive navigation; \
+         losing it causes stale overlays to accumulate in the Bevy world",
     );
 }
 

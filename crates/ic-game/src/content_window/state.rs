@@ -46,8 +46,8 @@ pub(crate) const ESCAPE_EXIT_CONFIRMATION_WINDOW_SECS: f64 = 1.0;
 /// priority so the browser opens on the first available playlist entry.
 const SHOWCASE_RESOURCE_HINTS: &[&str] = &[
     "ENGLISH.VQA",
-    "PROLOG.VQA",
     "INTRO.AUD",
+    "PROLOG.VQA",
     "ALLY1.VQA",
     "SOVIET1.VQA",
 ];
@@ -809,8 +809,8 @@ pub(crate) fn setup_content_window_ui(mut commands: Commands, state: Res<Content
 /// assets we want to land on first.
 ///
 /// The content lab is a validation tool, but first impressions still matter.
-/// If the current source tree contains well-known resources like `TANYA1.VQA`
-/// or `INTRO.VQA`, the initial selection should surface those before generic
+/// If the current source tree contains well-known resources like `ENGLISH.VQA`
+/// or `PROLOG.VQA`, the initial selection should surface those before generic
 /// sprites such as `1TNK.SHP`. That makes it obvious the browser is really
 /// reading Red Alert data rather than only rendering the synthetic bootstrap
 /// art.
@@ -831,6 +831,20 @@ fn showcase_preference_rank(entry: &ContentCatalogEntry) -> Option<usize> {
 pub(crate) fn handle_content_window_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<ContentLabState>,
+    mut gallery_root_query: Query<
+        &mut Visibility,
+        (
+            With<super::gallery::ContentGalleryRoot>,
+            Without<ContentWindowUiRoot>,
+        ),
+    >,
+    mut ui_root_query: Query<
+        &mut Visibility,
+        (
+            With<ContentWindowUiRoot>,
+            Without<super::gallery::ContentGalleryRoot>,
+        ),
+    >,
 ) {
     if keyboard.just_pressed(KeyCode::KeyQ) {
         state.cycle_catalog(-1);
@@ -864,6 +878,24 @@ pub(crate) fn handle_content_window_input(
     }
     if keyboard.just_pressed(KeyCode::KeyB) {
         state.toggle_browse_all();
+    }
+    if keyboard.just_pressed(KeyCode::Tab) {
+        // Toggle both the gallery tile panel and all text overlay panels
+        // together so Tab reveals a clean fullscreen preview.
+        let next = if let Ok(vis) = gallery_root_query.single() {
+            match *vis {
+                Visibility::Hidden => Visibility::Visible,
+                _ => Visibility::Hidden,
+            }
+        } else {
+            Visibility::Hidden
+        };
+        if let Ok(mut vis) = gallery_root_query.single_mut() {
+            *vis = next;
+        }
+        if let Ok(mut vis) = ui_root_query.single_mut() {
+            *vis = next;
+        }
     }
 }
 

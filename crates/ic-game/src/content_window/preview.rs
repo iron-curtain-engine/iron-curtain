@@ -361,10 +361,7 @@ pub(crate) struct ContentPreviewTracker {
     current_selection: Option<(usize, usize)>,
     pub(crate) selected_image_entity: Option<Entity>,
     display_image_handle: Option<Handle<Image>>,
-    /// The image entity this overlay is a child of.  Used to detect when the
-    /// selected image entity changes so the overlay can be respawned.
-    scanlines_overlay_parent: Option<Entity>,
-    /// The spawned scanlines overlay child entity.
+    /// The spawned fullscreen scanlines overlay entity.
     scanlines_overlay_entity: Option<Entity>,
     /// Material handle for the scanlines overlay (kept for uniform updates).
     scanlines_overlay_material: Option<Handle<ScanlinesMaterial>>,
@@ -405,9 +402,8 @@ impl ContentPreviewTracker {
             audio_sources.remove(handle.id());
         }
         self.audio_entity = None;
-        self.scanlines_overlay_parent = None;
-        self.scanlines_overlay_entity = None;
-        self.scanlines_overlay_material = None;
+        // scanlines_overlay_entity and _material are session-persistent —
+        // the fullscreen overlay is reused across entries, not per-entry.
         self.selected_image_entity = None;
         self.phase = PreviewPhase::Empty;
     }
@@ -417,9 +413,7 @@ impl ContentPreviewTracker {
         if let Some(handle) = self.display_image_handle.take() {
             images.remove(handle.id());
         }
-        self.scanlines_overlay_parent = None;
-        self.scanlines_overlay_entity = None;
-        self.scanlines_overlay_material = None;
+        // scanlines_overlay_entity and _material are session-persistent.
         self.selected_image_entity = None;
         self.phase = PreviewPhase::Empty;
     }
@@ -868,6 +862,36 @@ impl ContentPreviewTracker {
 
     pub(crate) fn test_playback_requested(&self) -> bool {
         self.playback_requested()
+    }
+
+    /// Sets the scanlines overlay entity as if `sync_scanlines_overlay` had
+    /// spawned it, without requiring a real Bevy world.
+    pub(crate) fn test_set_scanlines_overlay_entity(&mut self, entity: bevy::prelude::Entity) {
+        self.scanlines_overlay_entity = Some(entity);
+    }
+
+    /// Returns the current scanlines overlay entity handle.
+    pub(crate) fn test_scanlines_overlay_entity(&self) -> Option<bevy::prelude::Entity> {
+        self.scanlines_overlay_entity
+    }
+
+    /// Exposes `current_family` for assertion in tests.
+    pub(crate) fn test_current_family(&self) -> Option<ContentFamily> {
+        self.current_family()
+    }
+
+    /// Exercises the navigation-clear path (clearing per-entry state) using a
+    /// dummy image asset store so the test does not need a full Bevy world.
+    pub(crate) fn test_clear_for_navigation(&mut self) {
+        let mut images = bevy::asset::Assets::<bevy::prelude::Image>::default();
+        #[cfg(not(target_os = "windows"))]
+        self.clear_dynamic_assets(&mut images);
+        #[cfg(target_os = "windows")]
+        {
+            let mut audio =
+                bevy::asset::Assets::<super::preview_audio::PcmAudioSource>::default();
+            self.clear_dynamic_assets(&mut images, &mut audio);
+        }
     }
 }
 
@@ -1515,75 +1539,73 @@ pub(crate) fn handle_playlist_advance(
     }
 }
 
-/// Manages the GPU-composited CRT scanlines overlay for the selected video preview.
+/// Manages the GPU-composited CRT scanlines overlay for video playback.
 ///
-/// Spawns a `MaterialNode<ScanlinesMaterial>` as a child of the selected
-/// `ImageNode` entity, sized to cover it completely, so the scanlines are
-/// composited at screen resolution rather than at the VQA source resolution.
-/// Updates the `half_row_height` uniform whenever the video or window changes.
+/// A single fullscreen `MaterialNode<ScanlinesMaterial>` is lazily spawned
+/// once and kept alive for the session.  Its visibility is toggled each frame
+/// based on whether a VQA is actively playing and scanlines are enabled.
+///
+/// `half_row_height` is derived from the world-space billboard's displayed
+/// size, not the inspector thumbnail, so the lines are always matched to the
+/// actual on-screen video dimensions — exactly as OpenRA does with its
+/// `halfRowHeight = round(videoScale * windowScale / 2)` formula.
 pub(crate) fn sync_scanlines_overlay(
     mut commands: Commands,
     mut tracker: ResMut<ContentPreviewTracker>,
     mut scanlines_materials: ResMut<Assets<ScanlinesMaterial>>,
-    node_query: Query<&Node>,
+    billboard_query: Query<&Sprite, With<ContentPreviewBillboard>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     playback: Res<super::PlaybackSettings>,
 ) {
-    let current_parent = tracker.selected_image_entity;
-    let stored_parent = tracker.scanlines_overlay_parent;
+    // Scanlines are only shown when enabled in config, during video playback,
+    // and while at least one frame has been decoded.
+    let should_show = playback.0.scanlines
+        && tracker
+            .current_family()
+            .map_or(false, |f| matches!(f, ContentFamily::Video))
+        && tracker.has_visual();
 
-    // Detect image-entity change; clear stale overlay references (the old
-    // child entity was already despawned by Bevy's recursive despawn when the
-    // gallery rebuilt the parent).
-    if current_parent != stored_parent {
-        tracker.scanlines_overlay_entity = None;
-        tracker.scanlines_overlay_material = None;
-        tracker.scanlines_overlay_parent = current_parent;
-    }
-
-    let Some(image_entity) = current_parent else {
-        return;
+    let half_row_height = if should_show {
+        compute_scanline_half_row_height(&tracker, &billboard_query, &window_query).unwrap_or(3.0)
+    } else {
+        3.0
     };
 
-    // Remove the overlay if scanlines are disabled in config.
-    if !playback.0.scanlines {
-        if let Some(overlay_entity) = tracker.scanlines_overlay_entity.take() {
-            commands.entity(overlay_entity).despawn();
-            tracker.scanlines_overlay_material = None;
-        }
-        return;
-    }
-
-    let half_row_height =
-        compute_scanline_half_row_height(image_entity, &tracker, &node_query, &window_query)
-            .unwrap_or(1.0);
-
+    // Lazy-spawn the fullscreen overlay node once.
     if tracker.scanlines_overlay_entity.is_none() {
-        // Spawn the overlay as a child of the image node.
         let material_handle = scanlines_materials.add(ScanlinesMaterial {
             params: Vec4::new(half_row_height, 0.0, 0.0, 0.0),
         });
-        let mut new_overlay: Option<Entity> = None;
-        commands.entity(image_entity).with_children(|parent| {
-            new_overlay = Some(
-                parent
-                    .spawn((
-                        ContentScanlineOverlay,
-                        MaterialNode(material_handle.clone()),
-                        Node {
-                            position_type: PositionType::Absolute,
-                            width: Val::Percent(100.0),
-                            height: Val::Percent(100.0),
-                            ..default()
-                        },
-                    ))
-                    .id(),
-            );
-        });
-        tracker.scanlines_overlay_entity = new_overlay;
+        let entity = commands
+            .spawn((
+                ContentScanlineOverlay,
+                MaterialNode(material_handle.clone()),
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                // Below the text panels (Z=100) but above the world-space billboard.
+                GlobalZIndex(50),
+                Visibility::Hidden,
+            ))
+            .id();
+        tracker.scanlines_overlay_entity = Some(entity);
         tracker.scanlines_overlay_material = Some(material_handle);
-    } else if let Some(ref handle) = tracker.scanlines_overlay_material.clone() {
-        // Update the uniform if half_row_height changed significantly.
+    }
+
+    // Toggle visibility.
+    if let Some(entity) = tracker.scanlines_overlay_entity {
+        commands.entity(entity).insert(if should_show {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        });
+    }
+
+    // Update the uniform when half_row_height changes.
+    if let Some(ref handle) = tracker.scanlines_overlay_material.clone() {
         if let Some(mat) = scanlines_materials.get_mut(handle.id()) {
             if (mat.params.x - half_row_height).abs() > 0.5 {
                 mat.params.x = half_row_height;
@@ -1593,13 +1615,16 @@ pub(crate) fn sync_scanlines_overlay(
 }
 
 /// Computes `half_row_height` in physical screen pixels for the scanlines
-/// overlay, matching OpenRA's `halfRowHeight` formula.
+/// overlay, matching OpenRA's `halfRowHeight` formula:
 ///
-/// `half_row_height = round(logical_height / vqa_height * dpi_scale / 2)`
+/// `halfRowHeight = round(displayedHeight / sourceHeight * dpiScale / 2)`
+///
+/// `displayedHeight` comes from the world-space billboard (`sprite.custom_size`)
+/// so the computation reflects the actual on-screen video height at all window
+/// sizes and aspect ratios.
 fn compute_scanline_half_row_height(
-    image_entity: Entity,
     tracker: &ContentPreviewTracker,
-    node_query: &Query<&Node>,
+    billboard_query: &Query<&Sprite, With<ContentPreviewBillboard>>,
     window_query: &Query<&Window, With<PrimaryWindow>>,
 ) -> Option<f32> {
     let frame = tracker.current_visual_frame()?;
@@ -1607,18 +1632,16 @@ fn compute_scanline_half_row_height(
     if frame_height <= 0.0 {
         return None;
     }
-    let node = node_query.get(image_entity).ok()?;
-    let logical_height = match node.height {
-        Val::Px(h) => h,
-        _ => return None,
-    };
-    if logical_height <= 0.0 {
+    let display_height = billboard_query.single().ok()?.custom_size?.y;
+    if display_height <= 0.0 {
         return None;
     }
     let window_scale = window_query.single().ok()?.scale_factor();
-    let half_row = (logical_height / frame_height * window_scale / 2.0)
+    // Clamp to at least 3 physical pixels — matches OpenRA's minimum
+    // visibility on a 1080p display at standard zoom.
+    let half_row = (display_height / frame_height * window_scale / 2.0)
         .round()
-        .max(1.0);
+        .max(3.0);
     Some(half_row)
 }
 

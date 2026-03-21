@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bevy::prelude::*;
-use bevy::window::{MonitorSelection, Window, WindowMode, WindowPlugin, WindowResolution};
+use bevy::window::{
+    MonitorSelection, PresentMode, Window, WindowMode, WindowPlugin, WindowResolution,
+};
 use ic_cnc_content::IcCncContentPlugin;
 use ic_render::IcRenderPlugin;
 
@@ -181,6 +183,12 @@ fn content_lab_window(display: &crate::config::DisplayConfig) -> Window {
         resolution: WindowResolution::new(display.width, display.height),
         mode,
         resizable: mode == WindowMode::Windowed,
+        // Use non-blocking present so the swapchain never times out during
+        // heavy background decodes (e.g. a 28 MB VQA taking 2+ seconds).
+        // AutoVsync (the default) blocks until the next vsync deadline and
+        // can panic with SurfaceError::Timeout on integrated GPUs when
+        // memory bandwidth is saturated by large buffer allocations.
+        present_mode: PresentMode::AutoNoVsync,
         ..default()
     }
 }
