@@ -40,16 +40,16 @@ pub(crate) const GALLERY_VISIBLE_ROWS: usize = 3;
 pub(crate) const GALLERY_VISIBLE_SLOTS: usize = GALLERY_COLUMNS * GALLERY_VISIBLE_ROWS;
 const PAGE_STEP: isize = GALLERY_VISIBLE_SLOTS as isize;
 pub(crate) const ESCAPE_EXIT_CONFIRMATION_WINDOW_SECS: f64 = 1.0;
+/// Ordered autoplay playlist.  Every entry found in the catalog is played in
+/// this sequence, looping back to the first after the last finishes.  Missing
+/// files are silently skipped.  The same list is used as the initial-selection
+/// priority so the browser opens on the first available playlist entry.
 const SHOWCASE_RESOURCE_HINTS: &[&str] = &[
-    "TANYA1.VQA",
-    "TANYA2.VQA",
-    "INTRO.VQA",
-    "INTRO2.VQA",
-    "SIZZLE.VQA",
-    "SIZZLE2.VQA",
-    "TANYA1.VQP",
-    "TANYA2.VQP",
-    "1TNK.SHP",
+    "ENGLISH.VQA",
+    "PROLOG.VQA",
+    "INTRO.AUD",
+    "ALLY1.VQA",
+    "SOVIET1.VQA",
 ];
 
 /// A deterministic window of gallery entries that currently fit on screen.
@@ -100,6 +100,17 @@ pub struct ContentLabState {
     scan_progress: String,
     preview_summary: String,
     playback_summary: String,
+
+    /// Resolved `(catalog_index, entry_index)` pairs for each
+    /// `SHOWCASE_RESOURCE_HINTS` entry found in the current catalog set.
+    /// Rebuilt whenever the catalog changes.
+    autoplay_playlist: Vec<(usize, usize)>,
+    /// Current position in `autoplay_playlist`.  `None` when no playlist
+    /// entries were found during the last catalog scan.
+    autoplay_position: Option<usize>,
+    /// When `true`, every loop-completion advances through the full catalog
+    /// in alphabetical order instead of stepping through the fixed playlist.
+    pub(crate) browse_all_mode: bool,
 }
 
 impl ContentLabState {
@@ -120,6 +131,9 @@ impl ContentLabState {
             scan_progress: String::new(),
             preview_summary: "Scanning configured content roots...".into(),
             playback_summary: "Preview runtime will appear once a resource is selected.".into(),
+            autoplay_playlist: Vec::new(),
+            autoplay_position: None,
+            browse_all_mode: false,
         }
     }
 
@@ -143,8 +157,12 @@ impl ContentLabState {
             scan_progress: String::new(),
             preview_summary: "No preview has been loaded yet.".into(),
             playback_summary: "No active preview runtime.".into(),
+            autoplay_playlist: Vec::new(),
+            autoplay_position: None,
+            browse_all_mode: false,
         };
-        state.select_first_gallery_entry();
+        state.build_autoplay_playlist();
+        state.select_initial_entry();
         state
     }
 
@@ -324,7 +342,8 @@ impl ContentLabState {
         self.loading = false;
         self.preview_summary = "No preview has been loaded yet.".into();
         self.playback_summary = "No active preview runtime.".into();
-        self.select_first_gallery_entry();
+        self.build_autoplay_playlist();
+        self.select_initial_entry();
         self.dirty = true;
     }
 
@@ -514,6 +533,78 @@ impl ContentLabState {
         }
 
         lines.join("\n")
+    }
+
+    /// Scans catalogs for each `SHOWCASE_RESOURCE_HINTS` entry in order and
+    /// builds the resolved playlist of `(catalog_index, entry_index)` pairs.
+    /// Called whenever the catalog set changes.
+    fn build_autoplay_playlist(&mut self) {
+        let mut entries: Vec<(usize, usize)> = Vec::new();
+        for hint in SHOWCASE_RESOURCE_HINTS {
+            'hint: for (catalog_index, catalog) in self.catalogs.iter().enumerate() {
+                for (entry_index, entry) in catalog.entries.iter().enumerate() {
+                    let name = entry.location.file_name_upper();
+                    let path = entry.relative_path.to_ascii_uppercase();
+                    if name == *hint || path.ends_with(hint) {
+                        entries.push((catalog_index, entry_index));
+                        break 'hint;
+                    }
+                }
+            }
+        }
+        self.autoplay_playlist = entries;
+        self.autoplay_position = if self.autoplay_playlist.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    /// Picks the opening selection: first playlist entry when the playlist is
+    /// non-empty, otherwise falls back to the showcase-hint / alphabetical
+    /// logic in `select_first_gallery_entry`.
+    fn select_initial_entry(&mut self) {
+        if let Some((catalog_index, entry_index)) = self.autoplay_playlist.first().copied() {
+            self.selected_catalog = catalog_index;
+            self.selected_entry = entry_index;
+        } else {
+            self.select_first_gallery_entry();
+        }
+    }
+
+    /// Advances to the next entry in the active playback sequence.
+    ///
+    /// In browse-all mode every gallery entry in the current catalog is
+    /// visited in order.  In playlist mode only the resolved playlist entries
+    /// are cycled, wrapping back to the first after the last.
+    pub(crate) fn advance_current_autoplay(&mut self) {
+        if self.browse_all_mode {
+            self.move_selection(1);
+            return;
+        }
+        let Some(pos) = self.autoplay_position else {
+            return;
+        };
+        if self.autoplay_playlist.is_empty() {
+            return;
+        }
+        let next = (pos + 1) % self.autoplay_playlist.len();
+        self.autoplay_position = Some(next);
+        let (catalog_index, entry_index) = self.autoplay_playlist[next];
+        self.selected_catalog = catalog_index;
+        self.selected_entry = entry_index;
+        self.dirty = true;
+    }
+
+    /// Toggles browse-all slideshow mode on or off.
+    pub(crate) fn toggle_browse_all(&mut self) {
+        self.browse_all_mode = !self.browse_all_mode;
+        self.dirty = true;
+    }
+
+    /// Returns `true` when any form of auto-advance is active.
+    pub(crate) fn is_autoplay_active(&self) -> bool {
+        self.browse_all_mode || self.autoplay_position.is_some()
     }
 
     fn select_first_gallery_entry(&mut self) {
@@ -770,6 +861,9 @@ pub(crate) fn handle_content_window_input(
     }
     if keyboard.just_pressed(KeyCode::End) {
         state.move_selection_to_end();
+    }
+    if keyboard.just_pressed(KeyCode::KeyB) {
+        state.toggle_browse_all();
     }
 }
 

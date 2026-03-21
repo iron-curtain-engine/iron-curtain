@@ -530,8 +530,31 @@ fn load_aud_preview(
     let aud_file = cnc_formats::aud::AudFile::parse(&bytes)?;
     let stereo = aud_file.header.is_stereo();
     let channels = if stereo { 2u16 } else { 1u16 };
-    let max_samples = (aud_file.header.uncompressed_size as usize) / 2;
-    let samples = cnc_formats::aud::decode_adpcm(aud_file.compressed_data, stereo, max_samples);
+    // Branch on compression type before decoding.  decode_adpcm only handles
+    // SCOMP_WESTWOOD/SCOMP_SOS; calling it on raw PCM (SCOMP_NONE) would
+    // interpret the PCM bytes as ADPCM nibbles and produce corrupted audio.
+    let samples: Vec<i16> = if aud_file.header.compression == cnc_formats::aud::SCOMP_NONE {
+        if aud_file.header.is_16bit() {
+            aud_file.compressed_data
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        } else {
+            // 8-bit unsigned PCM → signed 16-bit (centre at 0x80, scale to i16 range).
+            aud_file.compressed_data
+                .iter()
+                .map(|&b| ((b as i16) - 128) * 256)
+                .collect()
+        }
+    } else {
+        // sample_frames() divides uncompressed_size by bytes-per-frame
+        // (2 for 16-bit, 1 for 8-bit), so this cap is correct regardless
+        // of the is_16bit() flag.  The old `/ 2` broke 8-bit AUD files by
+        // capping at half the needed sample count.
+        let max_samples = aud_file.header.sample_frames()
+            * aud_file.header.channel_count() as usize;
+        cnc_formats::aud::decode_adpcm(aud_file.compressed_data, stereo, max_samples)
+    };
     let waveform = waveform_frame(&samples, WAVEFORM_WIDTH, WAVEFORM_HEIGHT)?;
     let duration_seconds =
         audio_duration_seconds(samples.len(), aud_file.header.sample_rate as u32, channels);

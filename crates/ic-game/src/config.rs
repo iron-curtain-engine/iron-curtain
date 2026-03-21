@@ -111,6 +111,8 @@ pub struct PlaybackConfig {
     pub preview_max_height: f32,
     pub movie_max_width: f32,
     pub movie_max_height: f32,
+    /// Darken every other row to simulate CRT scanlines.
+    pub scanlines: bool,
 }
 
 impl Default for PlaybackConfig {
@@ -121,6 +123,7 @@ impl Default for PlaybackConfig {
             preview_max_height: 0.72,
             movie_max_width: 0.96,
             movie_max_height: 0.96,
+            scanlines: true,
         }
     }
 }

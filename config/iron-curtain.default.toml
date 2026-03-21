@@ -74,6 +74,11 @@ preview_max_height = 0.72
 movie_max_width    = 0.96
 movie_max_height   = 0.96
 
+# Darken every other row to simulate CRT scanlines.
+# Replicates the look of the original game on a 240p CRT monitor.
+# Set to false to display raw decoded pixels without the effect.
+scanlines = true
+
 # ─── Audio ──────────────────────────────────────────────────────────────────
 
 [audio]

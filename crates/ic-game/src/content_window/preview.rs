@@ -24,6 +24,9 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::ui::widget::ImageNode;
 use bevy::window::PrimaryWindow;
+use bevy::reflect::TypePath;
+use bevy::render::render_resource::AsBindGroup;
+use bevy::shader::ShaderRef;
 
 #[cfg(target_os = "windows")]
 use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, PlaybackSettings};
@@ -323,6 +326,29 @@ impl VisualPreviewSession {
     }
 }
 
+/// GPU-composited CRT scanlines overlay — one semi-transparent black child
+/// `MaterialNode` rendered at screen resolution over the video `ImageNode`.
+///
+/// Mirrors the OpenRA `VideoPlayerWidget.DrawOverlay` approach: alternating
+/// transparent and 50%-black rows spaced at half a VQA pixel-row height in
+/// physical screen pixels, so the lines stay thin regardless of upscale factor.
+#[derive(AsBindGroup, Asset, TypePath, Debug, Clone)]
+pub(crate) struct ScanlinesMaterial {
+    /// x = half_row_height in physical screen pixels; y/z/w unused.
+    #[uniform(0)]
+    pub params: Vec4,
+}
+
+impl UiMaterial for ScanlinesMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/scanlines.wgsl".into()
+    }
+}
+
+/// Marker for the scanlines overlay child node.
+#[derive(Component)]
+struct ContentScanlineOverlay;
+
 /// Tracks the currently active visual/audio preview surfaces.
 ///
 /// The Bevy-specific asset handles live on the outer struct because they
@@ -335,6 +361,13 @@ pub(crate) struct ContentPreviewTracker {
     current_selection: Option<(usize, usize)>,
     pub(crate) selected_image_entity: Option<Entity>,
     display_image_handle: Option<Handle<Image>>,
+    /// The image entity this overlay is a child of.  Used to detect when the
+    /// selected image entity changes so the overlay can be respawned.
+    scanlines_overlay_parent: Option<Entity>,
+    /// The spawned scanlines overlay child entity.
+    scanlines_overlay_entity: Option<Entity>,
+    /// Material handle for the scanlines overlay (kept for uniform updates).
+    scanlines_overlay_material: Option<Handle<ScanlinesMaterial>>,
     #[cfg(target_os = "windows")]
     audio_handle: Option<Handle<PcmAudioSource>>,
     #[cfg(target_os = "windows")]
@@ -342,6 +375,18 @@ pub(crate) struct ContentPreviewTracker {
 
     // --- State machine ---
     phase: PreviewPhase,
+
+    // --- Playlist loop detection ---
+    /// Wall-clock seconds elapsed since the current entry started playing.
+    /// Reset to 0 on every selection change.
+    loop_elapsed_seconds: f32,
+    /// Set to `true` when one full playback cycle has completed.
+    /// Consumed by `handle_playlist_advance` to advance to the next entry.
+    pub(crate) playlist_advance_pending: bool,
+    /// Duration of audio-only content (e.g. AUD files) that never reaches
+    /// `PreviewPhase::Ready` because they have no visual session.  Used by
+    /// the loop-detection path so the playlist still advances for them.
+    audio_only_loop_duration: Option<f32>,
 }
 
 impl ContentPreviewTracker {
@@ -360,6 +405,9 @@ impl ContentPreviewTracker {
             audio_sources.remove(handle.id());
         }
         self.audio_entity = None;
+        self.scanlines_overlay_parent = None;
+        self.scanlines_overlay_entity = None;
+        self.scanlines_overlay_material = None;
         self.selected_image_entity = None;
         self.phase = PreviewPhase::Empty;
     }
@@ -369,6 +417,9 @@ impl ContentPreviewTracker {
         if let Some(handle) = self.display_image_handle.take() {
             images.remove(handle.id());
         }
+        self.scanlines_overlay_parent = None;
+        self.scanlines_overlay_entity = None;
+        self.scanlines_overlay_material = None;
         self.selected_image_entity = None;
         self.phase = PreviewPhase::Empty;
     }
@@ -632,6 +683,32 @@ impl ContentPreviewTracker {
         }
     }
 
+    fn is_ready(&self) -> bool {
+        matches!(self.phase, PreviewPhase::Ready { .. })
+    }
+
+    /// Total duration of one playback cycle: frame count × frame duration for
+    /// visual content, audio duration for audio-only content.
+    pub(crate) fn loop_duration_seconds(&self) -> Option<f32> {
+        if let Some(fd) = self.frame_duration_seconds() {
+            let fc = self.frame_count();
+            if fc > 0 {
+                return Some(fd * fc as f32);
+            }
+        }
+        if let Some(ai) = self.audio_info() {
+            return Some(ai.duration_seconds);
+        }
+        self.audio_only_loop_duration
+    }
+
+    /// Resets loop-detection state when a new entry is selected.
+    pub(crate) fn reset_loop_state(&mut self) {
+        self.loop_elapsed_seconds = 0.0;
+        self.playlist_advance_pending = false;
+        self.audio_only_loop_duration = None;
+    }
+
     // ── Runtime diagnostics ──────────────────────────────────────────
 
     #[cfg(target_os = "windows")]
@@ -870,6 +947,7 @@ pub(crate) fn refresh_content_preview(
     #[cfg(not(target_os = "windows"))]
     tracker.clear_dynamic_assets(&mut images);
     tracker.current_selection = selection;
+    tracker.reset_loop_state();
     commands.remove_resource::<ContentPreviewLoadTask>();
 
     let Some((catalog_index, entry_index)) = selection else {
@@ -1290,6 +1368,22 @@ pub(crate) fn advance_content_preview_animation(
     mut images: ResMut<Assets<Image>>,
     mut image_query: Query<&mut ImageNode>,
 ) {
+    // Accumulate the playlist loop timer.  Gate on `is_ready` so we don't
+    // fire early during streaming (when frame_count is still partial).
+    // Audio-only content never reaches Ready, so we use audio_only_loop_duration
+    // as the fallback signal instead.
+    let track_loop = (tracker.is_ready() && tracker.playback_requested())
+        || tracker.audio_only_loop_duration.is_some();
+    if track_loop {
+        tracker.loop_elapsed_seconds += time.delta_secs();
+        if let Some(duration) = tracker.loop_duration_seconds() {
+            if tracker.loop_elapsed_seconds >= duration {
+                tracker.loop_elapsed_seconds %= duration;
+                tracker.playlist_advance_pending = true;
+            }
+        }
+    }
+
     let Some(frame_duration) = tracker.frame_duration_seconds() else {
         return;
     };
@@ -1342,6 +1436,18 @@ pub(crate) fn advance_content_preview_animation(
     mut images: ResMut<Assets<Image>>,
     mut image_query: Query<&mut ImageNode>,
 ) {
+    let track_loop = (tracker.is_ready() && tracker.playback_requested())
+        || tracker.audio_only_loop_duration.is_some();
+    if track_loop {
+        tracker.loop_elapsed_seconds += time.delta_secs();
+        if let Some(duration) = tracker.loop_duration_seconds() {
+            if tracker.loop_elapsed_seconds >= duration {
+                tracker.loop_elapsed_seconds %= duration;
+                tracker.playlist_advance_pending = true;
+            }
+        }
+    }
+
     let Some(frame_duration) = tracker.frame_duration_seconds() else {
         return;
     };
@@ -1394,6 +1500,128 @@ pub(crate) fn refresh_content_preview_status(
     state.set_playback_summary(tracker.runtime_status());
 }
 
+/// Advances to the next playlist or browse-all entry when a full playback
+/// cycle has been detected by `advance_content_preview_animation`.
+pub(crate) fn handle_playlist_advance(
+    mut state: ResMut<ContentLabState>,
+    mut tracker: ResMut<ContentPreviewTracker>,
+) {
+    if !tracker.playlist_advance_pending {
+        return;
+    }
+    tracker.playlist_advance_pending = false;
+    if state.is_autoplay_active() {
+        state.advance_current_autoplay();
+    }
+}
+
+/// Manages the GPU-composited CRT scanlines overlay for the selected video preview.
+///
+/// Spawns a `MaterialNode<ScanlinesMaterial>` as a child of the selected
+/// `ImageNode` entity, sized to cover it completely, so the scanlines are
+/// composited at screen resolution rather than at the VQA source resolution.
+/// Updates the `half_row_height` uniform whenever the video or window changes.
+pub(crate) fn sync_scanlines_overlay(
+    mut commands: Commands,
+    mut tracker: ResMut<ContentPreviewTracker>,
+    mut scanlines_materials: ResMut<Assets<ScanlinesMaterial>>,
+    node_query: Query<&Node>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    playback: Res<super::PlaybackSettings>,
+) {
+    let current_parent = tracker.selected_image_entity;
+    let stored_parent = tracker.scanlines_overlay_parent;
+
+    // Detect image-entity change; clear stale overlay references (the old
+    // child entity was already despawned by Bevy's recursive despawn when the
+    // gallery rebuilt the parent).
+    if current_parent != stored_parent {
+        tracker.scanlines_overlay_entity = None;
+        tracker.scanlines_overlay_material = None;
+        tracker.scanlines_overlay_parent = current_parent;
+    }
+
+    let Some(image_entity) = current_parent else {
+        return;
+    };
+
+    // Remove the overlay if scanlines are disabled in config.
+    if !playback.0.scanlines {
+        if let Some(overlay_entity) = tracker.scanlines_overlay_entity.take() {
+            commands.entity(overlay_entity).despawn();
+            tracker.scanlines_overlay_material = None;
+        }
+        return;
+    }
+
+    let half_row_height =
+        compute_scanline_half_row_height(image_entity, &tracker, &node_query, &window_query)
+            .unwrap_or(1.0);
+
+    if tracker.scanlines_overlay_entity.is_none() {
+        // Spawn the overlay as a child of the image node.
+        let material_handle = scanlines_materials.add(ScanlinesMaterial {
+            params: Vec4::new(half_row_height, 0.0, 0.0, 0.0),
+        });
+        let mut new_overlay: Option<Entity> = None;
+        commands.entity(image_entity).with_children(|parent| {
+            new_overlay = Some(
+                parent
+                    .spawn((
+                        ContentScanlineOverlay,
+                        MaterialNode(material_handle.clone()),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(100.0),
+                            ..default()
+                        },
+                    ))
+                    .id(),
+            );
+        });
+        tracker.scanlines_overlay_entity = new_overlay;
+        tracker.scanlines_overlay_material = Some(material_handle);
+    } else if let Some(ref handle) = tracker.scanlines_overlay_material.clone() {
+        // Update the uniform if half_row_height changed significantly.
+        if let Some(mat) = scanlines_materials.get_mut(handle.id()) {
+            if (mat.params.x - half_row_height).abs() > 0.5 {
+                mat.params.x = half_row_height;
+            }
+        }
+    }
+}
+
+/// Computes `half_row_height` in physical screen pixels for the scanlines
+/// overlay, matching OpenRA's `halfRowHeight` formula.
+///
+/// `half_row_height = round(logical_height / vqa_height * dpi_scale / 2)`
+fn compute_scanline_half_row_height(
+    image_entity: Entity,
+    tracker: &ContentPreviewTracker,
+    node_query: &Query<&Node>,
+    window_query: &Query<&Window, With<PrimaryWindow>>,
+) -> Option<f32> {
+    let frame = tracker.current_visual_frame()?;
+    let frame_height = frame.height() as f32;
+    if frame_height <= 0.0 {
+        return None;
+    }
+    let node = node_query.get(image_entity).ok()?;
+    let logical_height = match node.height {
+        Val::Px(h) => h,
+        _ => return None,
+    };
+    if logical_height <= 0.0 {
+        return None;
+    }
+    let window_scale = window_query.single().ok()?.scale_factor();
+    let half_row = (logical_height / frame_height * window_scale / 2.0)
+        .round()
+        .max(1.0);
+    Some(half_row)
+}
+
 fn load_preview_for_selected_entry(
     entry: &ContentCatalogEntry,
     catalogs: &[super::catalog::ContentCatalog],
@@ -1427,7 +1655,8 @@ fn apply_prepared_preview(
         let session =
             VisualPreviewSession::new(visual.frames().to_vec(), visual.frame_duration_seconds())?;
         let initial_frame = session.current_frame();
-        tracker.display_image_handle = Some(images.add(rgba_frame_to_image(initial_frame)));
+        tracker.display_image_handle =
+            Some(images.add(rgba_frame_to_image(initial_frame)));
         Some(session)
     });
 
@@ -1460,6 +1689,11 @@ fn apply_prepared_preview(
             audio_info,
             text_available,
         );
+    } else if let Some(ref ai) = audio_info {
+        // Audio-only content (e.g. AUD files): no visual session is created so
+        // the phase never transitions to Ready.  Store the duration here so the
+        // playlist loop-detection timer can still fire.
+        tracker.audio_only_loop_duration = Some(ai.duration_seconds);
     }
 
     Ok(Some(preview))
@@ -1848,7 +2082,10 @@ fn fit_preview_to_window(
     )
 }
 
-pub(crate) fn rgba_frame_to_image(frame: &ic_render::sprite::RgbaSpriteFrame) -> Image {
+pub(crate) fn rgba_frame_to_image(
+    frame: &ic_render::sprite::RgbaSpriteFrame,
+) -> Image {
+    let pixels = frame.rgba8_pixels().to_vec();
     Image::new(
         Extent3d {
             width: frame.width(),
@@ -1856,7 +2093,7 @@ pub(crate) fn rgba_frame_to_image(frame: &ic_render::sprite::RgbaSpriteFrame) ->
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        frame.rgba8_pixels().to_vec(),
+        pixels,
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     )
@@ -1873,13 +2110,14 @@ pub(crate) fn update_image_from_rgba_frame(
     image: &mut Image,
     frame: &ic_render::sprite::RgbaSpriteFrame,
 ) {
-    let frame_pixels = frame.rgba8_pixels();
+    let pixels = frame.rgba8_pixels().to_vec();
     let image_data = image.data.get_or_insert_with(Vec::new);
-    if image_data.len() == frame_pixels.len() {
-        image_data.copy_from_slice(frame_pixels);
+    if image_data.len() == pixels.len() {
+        image_data.copy_from_slice(&pixels);
     } else {
-        *image_data = frame_pixels.to_vec();
+        *image_data = pixels;
     }
     image.texture_descriptor.size.width = frame.width();
     image.texture_descriptor.size.height = frame.height();
 }
+

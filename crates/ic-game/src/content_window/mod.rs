@@ -44,9 +44,10 @@ use gallery::{refresh_content_gallery, setup_content_gallery_ui, ContentGalleryT
 pub use state::ContentLabState;
 
 use preview::{
-    advance_content_preview_animation, handle_content_preview_input, poll_content_preview_load,
-    refresh_content_preview, refresh_content_preview_status, setup_content_window_scene,
-    sync_content_preview_audio_state, sync_content_preview_billboard, ContentPreviewTracker,
+    advance_content_preview_animation, handle_content_preview_input, handle_playlist_advance,
+    poll_content_preview_load, refresh_content_preview, refresh_content_preview_status,
+    setup_content_window_scene, sync_content_preview_audio_state, sync_content_preview_billboard,
+    sync_scanlines_overlay, ContentPreviewTracker, ScanlinesMaterial,
 };
 #[cfg(target_os = "windows")]
 use preview_audio::register_preview_audio_source;
@@ -117,6 +118,7 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
     register_preview_audio_source(&mut app);
     app.add_plugins(IcCncContentPlugin)
         .add_plugins(IcRenderPlugin)
+        .add_plugins(UiMaterialPlugin::<ScanlinesMaterial>::default())
         .insert_resource(ClearColor(Color::srgb_u8(cc[0], cc[1], cc[2])))
         .insert_resource(content_state)
         .insert_resource(scan_task)
@@ -149,9 +151,11 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
                 refresh_content_preview,
                 poll_content_preview_load,
                 refresh_content_gallery,
+                sync_scanlines_overlay,
                 handle_content_preview_input,
                 sync_content_preview_audio_state,
                 advance_content_preview_animation,
+                handle_playlist_advance,
                 sync_content_preview_billboard,
                 refresh_content_preview_status,
             )
