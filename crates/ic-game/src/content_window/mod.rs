@@ -401,6 +401,12 @@ fn start_content_catalog_scan(
             }
 
             let total_entries: usize = catalogs.iter().map(|c| c.entries.len()).sum();
+            eprintln!(
+                "[catalog] scan complete: {} entries across {} sources | process RAM: {:.1} MB",
+                total_entries,
+                catalogs.len(),
+                process_memory_mb(),
+            );
             let _ = progress_sender.send(format!(
                 "Scan complete: {} entries across {} sources",
                 total_entries,
@@ -450,10 +456,13 @@ fn poll_content_catalog_scan(
 
     match receiver.try_recv() {
         Ok(catalogs) => {
+            let total: usize = catalogs.iter().map(|c| c.entries.len()).sum();
             let vfs = build_mix_vfs(&catalogs);
             eprintln!(
-                "[vfs] MIX overlay built: {} unique CRCs across mounted archives",
-                vfs.len()
+                "[catalog] received: {} entries | VFS: {} CRCs | process RAM: {:.1} MB",
+                total,
+                vfs.len(),
+                process_memory_mb(),
             );
             state.replace_catalogs(catalogs);
             commands.insert_resource(vfs);
@@ -468,6 +477,23 @@ fn poll_content_catalog_scan(
             commands.remove_resource::<ContentCatalogScanTask>();
         }
     }
+}
+
+/// Returns the current process memory usage in megabytes.
+///
+/// Uses the `sysinfo` crate (already a dependency via Bevy's `sysinfo_plugin`
+/// feature) to query process memory safely — no `unsafe` FFI.
+fn process_memory_mb() -> f64 {
+    use sysinfo::{Pid, System};
+    let pid = Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+    );
+    sys.process(pid)
+        .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
