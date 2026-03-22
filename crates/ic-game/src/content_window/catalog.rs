@@ -678,15 +678,36 @@ impl ContentCatalog {
         }
 
         // Recurse into nested MIX archives (depth-limited).
+        // Use a bounded entry reader so we only parse the nested header
+        // (a few hundred bytes) instead of reading the entire intermediate
+        // archive into RAM. MOVIES1.MIX is 369 MB — the original Red Alert
+        // engine indexed these with pure seeks on 16 MB machines.
         for (parent_index, _name, nested_relative_path) in nested_candidates {
-            if let Ok(Some(inner_bytes)) = reader.read_by_index(parent_index) {
-                self.mount_nested_mix_members(
-                    archive_path,
-                    &nested_relative_path,
-                    &inner_bytes,
-                    vec![parent_index],
-                    1,
-                );
+            match reader.open_entry_by_index(parent_index) {
+                Ok(Some(mut entry_reader)) => {
+                    match MixArchiveReader::open(&mut entry_reader) {
+                        Ok(mut inner_reader) => {
+                            self.mount_nested_mix_via_reader(
+                                archive_path,
+                                &nested_relative_path,
+                                &mut inner_reader,
+                                vec![parent_index],
+                                1,
+                            );
+                        }
+                        Err(error) => {
+                            self.notes.push(format!(
+                                "could not parse nested MIX {nested_relative_path}: {error}"
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.notes.push(format!(
+                        "could not open nested MIX entry {nested_relative_path}: {error}"
+                    ));
+                }
             }
         }
     }
@@ -779,6 +800,82 @@ impl ContentCatalog {
                 deeper_parents,
                 depth + 1,
             );
+        }
+    }
+
+    /// Mounts entries from a nested MIX archive using only its parsed header.
+    ///
+    /// Unlike `mount_nested_mix_members` (which requires the full archive in
+    /// RAM), this takes a `MixArchiveReader` that parsed just the index header
+    /// from a bounded entry reader. Only a few hundred bytes of I/O for the
+    /// header — no 369 MB allocation for MOVIES1.MIX.
+    fn mount_nested_mix_via_reader<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        outer_archive_path: &Path,
+        nested_relative_path: &str,
+        inner_reader: &mut ic_cnc_content::cnc_formats::mix::MixArchiveReader<R>,
+        parent_indices: Vec<usize>,
+        depth: usize,
+    ) {
+        const MAX_NESTING_DEPTH: usize = 3;
+        if depth > MAX_NESTING_DEPTH {
+            return;
+        }
+
+        let builtin_names = ic_cnc_content::cnc_formats::mix::builtin_name_map();
+        let embedded_names = inner_reader.embedded_names().unwrap_or_default();
+
+        let mut nested_candidates: Vec<(usize, String)> = Vec::new();
+
+        for (archive_index, entry) in inner_reader.entries().iter().enumerate() {
+            let logical_name = embedded_names
+                .get(&entry.crc)
+                .cloned()
+                .or_else(|| builtin_names.get(&entry.crc).cloned())
+                .map(|name| normalize_member_path(&name));
+            let logical_display_name = logical_name
+                .clone()
+                .unwrap_or_else(|| format!("CRC_{:08X}.BIN", entry.crc.to_raw()));
+            let logical_path = Path::new(&logical_display_name);
+            let relative_path = format!("{nested_relative_path}::{logical_display_name}");
+            self.push_entry(
+                ContentCatalogEntry {
+                    relative_path: relative_path.clone(),
+                    location: ContentEntryLocation::MixMember {
+                        archive_path: outer_archive_path.to_path_buf(),
+                        archive_index,
+                        crc_raw: entry.crc.to_raw(),
+                        logical_name,
+                        parent_indices: parent_indices.clone(),
+                    },
+                    size_bytes: entry.size as u64,
+                    family: classify_family(logical_path),
+                    support: classify_support(logical_path),
+                },
+                false,
+            );
+
+            if normalized_extension(logical_path).as_deref() == Some("mix") {
+                nested_candidates.push((archive_index, relative_path));
+            }
+        }
+
+        // Recurse into deeper-nested MIX archives by reading them into memory.
+        // MixEntryReader borrows the parent reader exclusively, preventing
+        // nested seek-based access, but inner-of-inner MIX files are
+        // typically small (only the first-level MOVIES1.MIX is 369 MB).
+        for (archive_index, relative_path) in nested_candidates {
+            if let Ok(Some(data)) = inner_reader.read_by_index(archive_index) {
+                let mut deeper_parents = parent_indices.clone();
+                deeper_parents.push(archive_index);
+                self.mount_nested_mix_members(
+                    outer_archive_path,
+                    &relative_path,
+                    &data,
+                    deeper_parents,
+                    depth + 1,
+                );
+            }
         }
     }
 

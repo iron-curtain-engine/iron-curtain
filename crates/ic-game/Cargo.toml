@@ -27,6 +27,7 @@ bevy = { version = "0.18.1", default-features = false, features = [
     "multi_threaded",
     "png",
     "std",
+    "sysinfo_plugin",
     "x11",
 ] }
 hound = "3.5"

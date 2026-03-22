@@ -240,7 +240,19 @@ pub(crate) struct VisualPreviewSession {
     frames: Vec<ic_render::sprite::RgbaSpriteFrame>,
     current_frame: usize,
     frame_duration_seconds: Option<f32>,
+    /// Total number of frames decoded so far (including evicted ones).
+    /// Used for accurate frame count reporting even when old frames are
+    /// evicted from the sliding window.
+    total_frames_decoded: usize,
 }
+
+/// Maximum number of decoded RGBA frames kept in the sliding window.
+///
+/// At 15 fps this is 8 seconds of video — enough for smooth playback and
+/// manual frame-stepping without holding an entire movie in RAM. A 640×400
+/// RGBA frame is ~1 MB, so 120 frames ≈ 120 MB ceiling instead of the
+/// 1.7 GB a full 2-minute cutscene would consume.
+const MAX_SESSION_FRAMES: usize = 120;
 
 impl VisualPreviewSession {
     /// Creates a playback session from decoded RGBA frames.
@@ -255,15 +267,23 @@ impl VisualPreviewSession {
             return None;
         }
 
+        let total = frames.len();
         Some(Self {
             frames,
             current_frame: 0,
             frame_duration_seconds,
+            total_frames_decoded: total,
         })
     }
 
-    /// Number of decoded frames currently cached in the session.
+    /// Total number of frames decoded so far (including evicted ones).
     pub(crate) fn frame_count(&self) -> usize {
+        self.total_frames_decoded
+    }
+
+    /// Number of frames currently held in the sliding window buffer.
+    #[allow(dead_code, reason = "useful for diagnostics and future memory reporting")]
+    pub(crate) fn buffered_frame_count(&self) -> usize {
         self.frames.len()
     }
 
@@ -276,9 +296,10 @@ impl VisualPreviewSession {
         1
     }
 
-    /// Zero-based index of the currently selected frame.
+    /// Zero-based global index of the currently selected frame.
     pub(crate) fn current_frame_index(&self) -> usize {
-        self.current_frame
+        let window_start = self.total_frames_decoded.saturating_sub(self.frames.len());
+        window_start + self.current_frame
     }
 
     /// Current RGBA frame that should be visible on screen.
@@ -293,20 +314,46 @@ impl VisualPreviewSession {
     }
 
     /// Selects the active frame without rebuilding the cached session.
+    ///
+    /// The `frame_index` is a global index (0..total_frames_decoded). If
+    /// the requested frame has been evicted from the sliding window, the
+    /// index is clamped to the nearest buffered frame.
     pub(crate) fn select_frame(&mut self, frame_index: usize) {
         if self.frames.is_empty() {
             self.current_frame = 0;
         } else {
-            self.current_frame = frame_index % self.frames.len();
+            // Convert global index to buffer-local index.
+            let window_start = self.total_frames_decoded.saturating_sub(self.frames.len());
+            if frame_index >= window_start {
+                self.current_frame = (frame_index - window_start) % self.frames.len();
+            } else {
+                // Requested frame was evicted — clamp to oldest available.
+                self.current_frame = 0;
+            }
         }
     }
 
     /// Appends additional frames to the session (for incremental streaming).
     ///
-    /// The current frame index is preserved so playback continues smoothly
-    /// from where it was rather than jumping forward or wrapping.
+    /// Old frames beyond [`MAX_SESSION_FRAMES`] are evicted from the front
+    /// of the buffer to cap memory usage, but only frames that have already
+    /// been played (behind the current playback position). This prevents the
+    /// sliding window from evicting frames the viewer hasn't seen yet, which
+    /// would cause the video to jump ahead ("start from the middle").
     pub(crate) fn push_frames(&mut self, new_frames: Vec<ic_render::sprite::RgbaSpriteFrame>) {
+        self.total_frames_decoded += new_frames.len();
         self.frames.extend(new_frames);
+
+        // Only evict frames behind the current playback position.
+        if self.frames.len() > MAX_SESSION_FRAMES {
+            let evict_budget = self.frames.len() - MAX_SESSION_FRAMES;
+            // Never evict past the current frame — only reclaim already-played frames.
+            let safe_evict = evict_budget.min(self.current_frame);
+            if safe_evict > 0 {
+                self.frames.drain(..safe_evict);
+                self.current_frame -= safe_evict;
+            }
+        }
     }
 
     /// Dimensions of the currently active frame.
@@ -556,6 +603,10 @@ impl ContentPreviewTracker {
         )
     }
 
+    fn is_streaming(&self) -> bool {
+        matches!(self.phase, PreviewPhase::StreamingFirstFrame { .. })
+    }
+
     fn visual_session(&self) -> Option<&VisualPreviewSession> {
         match &self.phase {
             PreviewPhase::StreamingFirstFrame { visual_session, .. }
@@ -640,9 +691,14 @@ impl ContentPreviewTracker {
         }
     }
 
-    fn frame_count(&self) -> usize {
+    pub(crate) fn frame_count(&self) -> usize {
         self.visual_session()
             .map_or(0, VisualPreviewSession::frame_count)
+    }
+
+    pub(crate) fn buffered_frame_count(&self) -> usize {
+        self.visual_session()
+            .map_or(0, VisualPreviewSession::buffered_frame_count)
     }
 
     fn current_frame_index(&self) -> usize {
@@ -664,7 +720,7 @@ impl ContentPreviewTracker {
             .map(VisualPreviewSession::current_frame_dimensions)
     }
 
-    fn current_family(&self) -> Option<ContentFamily> {
+    pub(crate) fn current_family(&self) -> Option<ContentFamily> {
         self.phase_family()
     }
 
@@ -1428,6 +1484,7 @@ pub(crate) fn advance_content_preview_animation(
 
     let frame_count = tracker.frame_count();
     let current = tracker.current_frame_index();
+    let streaming = tracker.is_streaming();
 
     // When audio-syncing, derive the frame index from the audio sink's
     // playback position.  We look up the sink by tracker.audio_entity rather
@@ -1451,7 +1508,22 @@ pub(crate) fn advance_content_preview_animation(
         let mut advanced = current;
         while *timer >= frame_duration {
             *timer -= frame_duration;
-            advanced = (advanced + 1) % frame_count;
+            if streaming {
+                // During streaming, advance linearly without wrapping.
+                // New frames are still arriving; wrapping to 0 would jump
+                // to an evicted frame and appear to "start from the middle".
+                let next = advanced + 1;
+                if next < frame_count {
+                    advanced = next;
+                } else {
+                    // Reached the end of available frames — hold on the
+                    // last frame until more arrive.
+                    *timer = 0.0;
+                    break;
+                }
+            } else {
+                advanced = (advanced + 1) % frame_count;
+            }
         }
         Some(advanced)
     };
@@ -1493,6 +1565,7 @@ pub(crate) fn advance_content_preview_animation(
     let frame_count = tracker.frame_count();
     let current = tracker.current_frame_index();
 
+    let streaming = tracker.is_streaming();
     let Some(timer) = tracker.frame_timer_seconds_mut() else {
         return;
     };
@@ -1500,7 +1573,17 @@ pub(crate) fn advance_content_preview_animation(
     let mut advanced = current;
     while *timer >= frame_duration {
         *timer -= frame_duration;
-        advanced = (advanced + 1) % frame_count;
+        if streaming {
+            let next = advanced + 1;
+            if next < frame_count {
+                advanced = next;
+            } else {
+                *timer = 0.0;
+                break;
+            }
+        } else {
+            advanced = (advanced + 1) % frame_count;
+        }
     }
 
     if current != advanced {

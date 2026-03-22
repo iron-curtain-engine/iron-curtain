@@ -30,6 +30,7 @@ use crate::demo::DemoSceneError;
 use crate::LaunchOptions;
 
 mod catalog;
+mod debug_overlay;
 mod gallery;
 mod preview;
 #[cfg(target_os = "windows")]
@@ -244,6 +245,9 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
     app.add_plugins(IcCncContentPlugin)
         .add_plugins(IcRenderPlugin)
         .add_plugins(UiMaterialPlugin::<ScanlinesMaterial>::default())
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(bevy::diagnostic::SystemInformationDiagnosticsPlugin)
+        .insert_resource(debug_overlay::DebugOverlayState::default())
         .insert_resource(ClearColor(Color::srgb_u8(cc[0], cc[1], cc[2])))
         .insert_resource(content_state)
         .insert_resource(scan_task)
@@ -261,6 +265,7 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
                 setup_content_window_scene,
                 setup_content_window_ui,
                 setup_content_gallery_ui,
+                debug_overlay::setup_debug_overlay,
                 refresh_content_preview,
                 refresh_content_gallery,
                 sync_content_preview_billboard,
@@ -291,6 +296,14 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
         .add_systems(
             Update,
             refresh_content_window_text.after(refresh_content_preview_status),
+        )
+        .add_systems(
+            Update,
+            (
+                debug_overlay::toggle_debug_overlay,
+                debug_overlay::refresh_debug_overlay,
+            )
+                .chain(),
         );
     app.run();
 
