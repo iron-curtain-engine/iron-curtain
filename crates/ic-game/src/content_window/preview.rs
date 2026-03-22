@@ -77,15 +77,14 @@ pub(crate) fn preview_surface_policy_for_family(
 }
 
 /// Returns `true` when preview preparation should happen off the main Bevy
-/// thread.
+/// thread via the VQA streaming decoder.
 ///
-/// With the current `cnc-formats` API, VQA preview preparation is whole-file:
-/// read bytes, decode every frame, extract audio, and convert frames to RGBA.
-/// Moving that work onto a background thread is the best local improvement we
-/// can make in this repo without first extending the lower-level parser crate
-/// to expose a true frame-by-frame streaming API.
-pub(crate) fn should_background_load_preview_for_family(family: ContentFamily) -> bool {
-    matches!(family, ContentFamily::Video)
+/// Only `.vqa` files use the VQA streaming path. Other video-family formats
+/// (`.vqp`, `.wsa`, `.bk2`) have their own decoders routed through the
+/// normal `load_preview_for_entry` path and don't need background loading.
+pub(crate) fn should_background_load_preview(entry: &super::catalog::ContentCatalogEntry) -> bool {
+    entry.family == ContentFamily::Video
+        && super::preview_decode::entry_extension_lower(entry).as_deref() == Some("vqa")
 }
 
 /// Marker for the visible world-space fallback surface that mirrors the
@@ -372,6 +371,9 @@ pub(crate) struct ContentPreviewTracker {
 
     // --- State machine ---
     phase: PreviewPhase,
+
+    /// True when the current entry is a `.vqa` file (used for scanlines gating).
+    is_vqa: bool,
 
     // --- Playlist loop detection ---
     /// Wall-clock seconds elapsed since the current entry started playing.
@@ -666,6 +668,10 @@ impl ContentPreviewTracker {
         self.phase_family()
     }
 
+    fn is_vqa_playback(&self) -> bool {
+        self.is_vqa && self.phase_family() == Some(ContentFamily::Video)
+    }
+
     fn frame_duration_seconds(&self) -> Option<f32> {
         self.visual_session()
             .and_then(VisualPreviewSession::frame_duration_seconds)
@@ -939,6 +945,7 @@ pub(crate) fn refresh_content_preview(
     mut state: ResMut<ContentLabState>,
     mut tracker: ResMut<ContentPreviewTracker>,
     archive_cache: Res<super::ArchivePreloadCache>,
+    handle_cache: Res<super::ArchiveHandleCache>,
     #[cfg(target_os = "windows")]
     existing_audio_entities: Query<(Entity, Option<&AudioSink>), With<ContentPreviewAudio>>,
     #[cfg(not(target_os = "windows"))]
@@ -989,7 +996,8 @@ pub(crate) fn refresh_content_preview(
         state.set_playback_summary("No active preview runtime.");
         return;
     };
-    if should_background_load_preview_for_family(entry.family) {
+    tracker.is_vqa = should_background_load_preview(&entry);
+    if tracker.is_vqa {
         tracker.begin_loading(entry.family);
         state.set_preview_summary(format!(
             "Loading preview for {}...\nFirst frame will appear momentarily while remaining frames decode in the background.",
@@ -1003,13 +1011,14 @@ pub(crate) fn refresh_content_preview(
             entry,
             state.catalogs().to_vec(),
             archive_cache.clone(),
+            handle_cache.clone(),
         ));
         return;
     }
 
     match apply_prepared_preview(
         &entry,
-        load_preview_for_selected_entry(&entry, state.catalogs(), Some(&archive_cache)),
+        load_preview_for_selected_entry(&entry, state.catalogs(), Some(&archive_cache), Some(&handle_cache)),
         &mut commands,
         &mut images,
         #[cfg(target_os = "windows")]
@@ -1031,6 +1040,7 @@ pub(crate) fn refresh_content_preview(
             state.set_playback_summary("No active preview runtime.");
         }
         Err(error) => {
+            eprintln!("[preview] load failed: {} — {error}", entry.relative_path);
             state.set_preview_summary(format!(
                 "Preview load failed for {}:\n{error}",
                 entry.relative_path
@@ -1163,6 +1173,7 @@ pub(crate) fn poll_content_preview_load(
                         state.set_playback_summary("No active preview runtime.");
                     }
                     Err(error) => {
+                        eprintln!("[preview] async load failed: {} — {error}", entry.relative_path);
                         state.set_preview_summary(format!(
                             "Preview load failed for {}:\n{error}",
                             entry.relative_path
@@ -1557,12 +1568,12 @@ pub(crate) fn sync_scanlines_overlay(
     window_query: Query<&Window, With<PrimaryWindow>>,
     playback: Res<super::PlaybackSettings>,
 ) {
-    // Scanlines are only shown when enabled in config, during video playback,
-    // and while at least one frame has been decoded.
+    // Scanlines are only shown when enabled in config, during VQA video
+    // playback, and while at least one frame has been decoded. Other
+    // video-family formats (VQP tables, WSA animations) don't warrant
+    // the CRT effect.
     let should_show = playback.0.scanlines
-        && tracker
-            .current_family()
-            .map_or(false, |f| matches!(f, ContentFamily::Video))
+        && tracker.is_vqa_playback()
         && tracker.has_visual();
 
     let half_row_height = if should_show {
@@ -1649,8 +1660,9 @@ fn load_preview_for_selected_entry(
     entry: &ContentCatalogEntry,
     catalogs: &[super::catalog::ContentCatalog],
     cache: Option<&super::ArchivePreloadCache>,
+    handles: Option<&super::ArchiveHandleCache>,
 ) -> Result<Option<PreparedContentPreview>, PreviewLoadError> {
-    load_preview_for_entry(entry, catalogs, cache)
+    load_preview_for_entry(entry, catalogs, cache, handles)
 }
 
 fn apply_prepared_preview(
@@ -1774,9 +1786,10 @@ fn start_content_preview_load(
     entry: ContentCatalogEntry,
     catalogs: Vec<ContentCatalog>,
     archive_cache: super::ArchivePreloadCache,
+    handle_cache: super::ArchiveHandleCache,
 ) -> ContentPreviewLoadTask {
     let (sender, receiver) = mpsc::channel();
-    let is_video = should_background_load_preview_for_family(entry.family);
+    let is_video = should_background_load_preview(&entry);
 
     thread::Builder::new()
         .name("ic-content-preview-load".into())
@@ -1785,7 +1798,7 @@ fn start_content_preview_load(
                 // Streaming VQA path: read file once, decode first frame for
                 // instant display, then stream remaining frames incrementally.
                 let t0 = std::time::Instant::now();
-                let bytes = match super::preview_decode::load_entry_bytes_cached(&entry, Some(&archive_cache)) {
+                let bytes = match super::preview_decode::load_entry_bytes_cached(&entry, Some(&archive_cache), Some(&handle_cache)) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = sender.send(PreviewLoadMessage::Full {
@@ -1879,7 +1892,7 @@ fn start_content_preview_load(
                 );
             } else {
                 // Non-video path: single full decode.
-                let preview = load_preview_for_selected_entry(&entry, &catalogs, Some(&archive_cache));
+                let preview = load_preview_for_selected_entry(&entry, &catalogs, Some(&archive_cache), Some(&handle_cache));
                 let _ = sender.send(PreviewLoadMessage::Full {
                     selection,
                     entry,

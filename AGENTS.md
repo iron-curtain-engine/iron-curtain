@@ -204,6 +204,12 @@ They are not optional style preferences.
 - When closing work, call out the exact tests, demos, replay captures, or
   benchmark artifacts that serve as evidence. "Implemented" without proof is
   not acceptable.
+- Every problem, issue, or bug fixed must include a regression test and
+  additional security/vulnerability tests to prevent regressions and
+  exercise the relevant failure modes. These tests must be implemented as
+  part of the resolution/patch (i.e., included in the same change set that
+  fixes the issue) so the fix is verifiable and protected by automated
+  checks.
 
 ### 2. Commenting and Documentation for Context Isolation
 

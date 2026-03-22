@@ -190,6 +190,13 @@ pub enum ContentEntryLocation {
         archive_index: usize,
         crc_raw: u32,
         logical_name: Option<String>,
+        /// Chain of archive indices to reach the containing MIX when nested.
+        ///
+        /// Empty for top-level entries. For a file inside `CONQUER.MIX` (index 5
+        /// in `MAIN.MIX`), this would be `vec![5]` — read index 5 from the
+        /// outer archive to obtain `CONQUER.MIX` bytes, then use `archive_index`
+        /// within that inner archive.
+        parent_indices: Vec<usize>,
     },
     /// Resource bytes live inside a Petroglyph `.meg` archive.
     MegMember {
@@ -633,30 +640,144 @@ impl ContentCatalog {
             .map(|(i, e)| (i, e.crc, e.offset, e.size))
             .collect();
 
-        for (archive_index, crc, _offset, size) in entries {
+        // Collect inner MIX entries for recursive mounting after the main loop.
+        let mut nested_candidates: Vec<(usize, String, String)> = Vec::new();
+
+        for (archive_index, crc, _offset, size) in &entries {
             let logical_name = embedded_names
-                .get(&crc)
+                .get(crc)
                 .cloned()
-                .or_else(|| builtin_names.get(&crc).cloned())
+                .or_else(|| builtin_names.get(crc).cloned())
                 .map(|name| normalize_member_path(&name));
             let logical_display_name = logical_name
                 .clone()
                 .unwrap_or_else(|| format!("CRC_{:08X}.BIN", crc.to_raw()));
             let logical_path = Path::new(&logical_display_name);
+            let relative_path = format!("{archive_relative_path}::{logical_display_name}");
             self.push_entry(
                 ContentCatalogEntry {
-                    relative_path: format!("{archive_relative_path}::{logical_display_name}"),
+                    relative_path: relative_path.clone(),
                     location: ContentEntryLocation::MixMember {
                         archive_path: archive_path.to_path_buf(),
-                        archive_index,
+                        archive_index: *archive_index,
                         crc_raw: crc.to_raw(),
                         logical_name,
+                        parent_indices: vec![],
                     },
-                    size_bytes: size as u64,
+                    size_bytes: *size as u64,
                     family: classify_family(logical_path),
                     support: classify_support(logical_path),
                 },
                 false,
+            );
+
+            // Queue inner MIX archives for recursive mounting.
+            if normalized_extension(logical_path).as_deref() == Some("mix") {
+                nested_candidates.push((*archive_index, logical_display_name, relative_path));
+            }
+        }
+
+        // Recurse into nested MIX archives (depth-limited).
+        for (parent_index, _name, nested_relative_path) in nested_candidates {
+            if let Ok(Some(inner_bytes)) = reader.read_by_index(parent_index) {
+                self.mount_nested_mix_members(
+                    archive_path,
+                    &nested_relative_path,
+                    &inner_bytes,
+                    vec![parent_index],
+                    1,
+                );
+            }
+        }
+    }
+
+    /// Recursively mounts entries from an inner MIX archive already read into memory.
+    ///
+    /// `parent_indices` tracks the chain of archive indices from the outermost
+    /// archive to reach this level. `depth` prevents runaway recursion on
+    /// malformed data (capped at 3 levels).
+    fn mount_nested_mix_members(
+        &mut self,
+        outer_archive_path: &Path,
+        nested_relative_path: &str,
+        inner_bytes: &[u8],
+        parent_indices: Vec<usize>,
+        depth: usize,
+    ) {
+        use ic_cnc_content::cnc_formats::mix::MixArchive;
+
+        const MAX_NESTING_DEPTH: usize = 3;
+        if depth > MAX_NESTING_DEPTH {
+            return;
+        }
+
+        let inner_archive = match MixArchive::parse(inner_bytes) {
+            Ok(a) => a,
+            Err(error) => {
+                self.notes.push(format!(
+                    "could not parse nested MIX {nested_relative_path}: {error}"
+                ));
+                return;
+            }
+        };
+
+        let builtin_names = ic_cnc_content::cnc_formats::mix::builtin_name_map();
+        let embedded_names = inner_archive.embedded_names();
+
+        let mut nested_candidates: Vec<(usize, String, String, Vec<u8>)> = Vec::new();
+
+        for (archive_index, entry) in inner_archive.entries().iter().enumerate() {
+            let logical_name = embedded_names
+                .get(&entry.crc)
+                .cloned()
+                .or_else(|| builtin_names.get(&entry.crc).cloned())
+                .map(|name| normalize_member_path(&name));
+            let logical_display_name = logical_name
+                .clone()
+                .unwrap_or_else(|| format!("CRC_{:08X}.BIN", entry.crc.to_raw()));
+            let logical_path = Path::new(&logical_display_name);
+            let relative_path = format!("{nested_relative_path}::{logical_display_name}");
+            self.push_entry(
+                ContentCatalogEntry {
+                    relative_path: relative_path.clone(),
+                    location: ContentEntryLocation::MixMember {
+                        archive_path: outer_archive_path.to_path_buf(),
+                        archive_index,
+                        crc_raw: entry.crc.to_raw(),
+                        logical_name,
+                        parent_indices: parent_indices.clone(),
+                    },
+                    size_bytes: entry.size as u64,
+                    family: classify_family(logical_path),
+                    support: classify_support(logical_path),
+                },
+                false,
+            );
+
+            // Queue deeper nesting.
+            if normalized_extension(logical_path).as_deref() == Some("mix") {
+                if let Some(data) = inner_archive.get_by_index(archive_index) {
+                    let mut deeper_parents = parent_indices.clone();
+                    deeper_parents.push(archive_index);
+                    nested_candidates.push((
+                        archive_index,
+                        relative_path,
+                        logical_display_name,
+                        data.to_vec(),
+                    ));
+                }
+            }
+        }
+
+        for (_index, relative_path, _name, data) in nested_candidates {
+            let mut deeper_parents = parent_indices.clone();
+            deeper_parents.push(_index);
+            self.mount_nested_mix_members(
+                outer_archive_path,
+                &relative_path,
+                &data,
+                deeper_parents,
+                depth + 1,
             );
         }
     }

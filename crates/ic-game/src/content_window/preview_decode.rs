@@ -48,6 +48,7 @@ const TMP_PREVIEW_COLUMNS: usize = 4;
 
 thread_local! {
     static THREAD_LOCAL_CACHE: RefCell<Option<super::ArchivePreloadCache>> = const { RefCell::new(None) };
+    static THREAD_LOCAL_HANDLES: RefCell<Option<super::ArchiveHandleCache>> = const { RefCell::new(None) };
 }
 
 /// Static preview surfaces the content lab can offer for one catalog entry.
@@ -248,11 +249,13 @@ pub(crate) fn load_preview_for_entry(
     entry: &ContentCatalogEntry,
     catalogs: &[ContentCatalog],
     cache: Option<&super::ArchivePreloadCache>,
+    handles: Option<&super::ArchiveHandleCache>,
 ) -> Result<Option<PreparedContentPreview>, PreviewLoadError> {
-    // Stash the cache in a thread-local so every load_entry_bytes() call in
+    // Stash the caches in thread-locals so every load_entry_bytes() call in
     // the individual loaders can transparently benefit from preloaded archives
-    // without threading the parameter through every function signature.
+    // and persistent handles without threading parameters through every function.
     THREAD_LOCAL_CACHE.with_borrow_mut(|tl| *tl = cache.cloned());
+    THREAD_LOCAL_HANDLES.with_borrow_mut(|tl| *tl = handles.cloned());
     let result = match entry_extension_lower(entry).as_deref() {
         Some("shp") => Ok(Some(load_shp_preview(entry, catalogs)?)),
         Some("pal") => Ok(Some(load_palette_preview(entry)?)),
@@ -361,49 +364,80 @@ pub(crate) fn resolve_palette_entry_for_visual<'a>(
 }
 
 pub(crate) fn load_entry_bytes(entry: &ContentCatalogEntry) -> Result<Vec<u8>, PreviewLoadError> {
-    THREAD_LOCAL_CACHE.with_borrow(|tl| {
-        load_entry_bytes_cached(entry, tl.as_ref())
+    THREAD_LOCAL_CACHE.with_borrow(|cache| {
+        THREAD_LOCAL_HANDLES.with_borrow(|handles| {
+            load_entry_bytes_impl(entry, cache.as_ref(), handles.as_ref())
+        })
     })
 }
 
-/// Loads entry bytes, optionally using a preloaded in-memory archive cache.
+/// Loads entry bytes with a three-tier strategy:
 ///
-/// When the cache contains the archive for an archive member, the entry is
-/// extracted from the cached buffer (a fast in-memory operation) instead of
-/// reopening the file on disk.
+/// 1. **RAM cache** (`ArchivePreloadCache`) — fastest, used when `preload_archives` is on.
+/// 2. **Persistent handle** (`ArchiveHandleCache`) — index parsed once, subsequent reads
+///    are a cheap seek + read. This is the default fast path.
+/// 3. **Disk re-open** — fallback when neither cache is available.
 pub(crate) fn load_entry_bytes_cached(
     entry: &ContentCatalogEntry,
     cache: Option<&super::ArchivePreloadCache>,
+    handles: Option<&super::ArchiveHandleCache>,
+) -> Result<Vec<u8>, PreviewLoadError> {
+    load_entry_bytes_impl(entry, cache, handles)
+}
+
+fn load_entry_bytes_impl(
+    entry: &ContentCatalogEntry,
+    cache: Option<&super::ArchivePreloadCache>,
+    handles: Option<&super::ArchiveHandleCache>,
 ) -> Result<Vec<u8>, PreviewLoadError> {
     match &entry.location {
         ContentEntryLocation::Filesystem { absolute_path } => Ok(fs::read(absolute_path)?),
         ContentEntryLocation::MixMember {
             archive_path,
             archive_index,
+            parent_indices,
             ..
         } => {
             use ic_cnc_content::cnc_formats::mix::MixArchiveReader;
+
+            // ── Nested MIX path (parent_indices non-empty) ──────────
+            //
+            // For entries like MAIN.MIX::MOVIES1.MIX::PROLOG.VQA, the
+            // expensive step is reading the intermediate archive (369 MB
+            // MOVIES1.MIX) from the outer archive. Cache those bytes so
+            // browsing multiple entries from the same intermediate MIX
+            // only pays the read cost once.
+            if !parent_indices.is_empty() {
+                return load_nested_mix_entry(
+                    archive_path, parent_indices, *archive_index, &entry.relative_path,
+                    cache, handles,
+                );
+            }
+
+            // ── Flat MIX path (no nesting) ──────────────────────────
+
+            // Tier 1: RAM cache (full archive in memory).
             let cached_bytes = cache
                 .and_then(|c| c.archives.lock().ok())
                 .and_then(|map| map.get(archive_path).cloned());
             if let Some(bytes) = cached_bytes {
-                eprintln!("[cache] HIT mix {} ({}B in RAM)", entry.relative_path, bytes.len());
                 let cursor = std::io::Cursor::new(bytes.as_ref());
                 let mut reader = MixArchiveReader::open(cursor)?;
-                return reader
-                    .read_by_index(*archive_index)?
-                    .ok_or_else(|| PreviewLoadError::EmptyVisual {
-                        entry_path: entry.relative_path.clone(),
-                    });
+                return read_mix_chain(&mut reader, parent_indices, *archive_index, &entry.relative_path);
             }
-            eprintln!("[cache] MISS mix {} (reading from disk)", entry.relative_path);
+
+            // Tier 2: Persistent file handle (index parsed once).
+            if let Some(handle_cache) = handles {
+                if let Ok(handle) = handle_cache.get_or_open_mix(archive_path) {
+                    let mut reader = handle.lock().unwrap_or_else(|e| e.into_inner());
+                    return read_mix_chain(&mut reader, parent_indices, *archive_index, &entry.relative_path);
+                }
+            }
+
+            // Tier 3: Fallback — open, parse, read, close.
             let file = fs::File::open(archive_path)?;
             let mut reader = MixArchiveReader::open(std::io::BufReader::new(file))?;
-            reader
-                .read_by_index(*archive_index)?
-                .ok_or_else(|| PreviewLoadError::EmptyVisual {
-                    entry_path: entry.relative_path.clone(),
-                })
+            read_mix_chain(&mut reader, parent_indices, *archive_index, &entry.relative_path)
         }
         ContentEntryLocation::MegMember {
             archive_path,
@@ -411,6 +445,8 @@ pub(crate) fn load_entry_bytes_cached(
             ..
         } => {
             use ic_cnc_content::cnc_formats::meg::MegArchiveReader;
+
+            // Tier 1: RAM cache.
             let cached_bytes = cache
                 .and_then(|c| c.archives.lock().ok())
                 .and_then(|map| map.get(archive_path).cloned());
@@ -423,6 +459,20 @@ pub(crate) fn load_entry_bytes_cached(
                         entry_path: entry.relative_path.clone(),
                     });
             }
+
+            // Tier 2: Persistent file handle.
+            if let Some(handle_cache) = handles {
+                if let Ok(handle) = handle_cache.get_or_open_meg(archive_path) {
+                    let mut reader = handle.lock().unwrap_or_else(|e| e.into_inner());
+                    return reader
+                        .read_by_index(*archive_index)?
+                        .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                            entry_path: entry.relative_path.clone(),
+                        });
+                }
+            }
+
+            // Tier 3: Fallback.
             let file = fs::File::open(archive_path)?;
             let mut reader = MegArchiveReader::open(std::io::BufReader::new(file))?;
             reader
@@ -432,6 +482,205 @@ pub(crate) fn load_entry_bytes_cached(
                 })
         }
     }
+}
+
+/// Maximum size of an intermediate MIX archive during nested chain traversal.
+///
+/// Prevents a crafted archive from causing unbounded memory allocation.
+/// RA1's movie MIX archives can reach ~370 MB (MOVIES1.MIX); 512 MB
+/// accommodates any legitimate archive while blocking degenerate inputs.
+const MAX_NESTED_MIX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Maximum nesting depth for `read_mix_chain`.
+///
+/// Matches `mount_nested_mix_members` in catalog.rs. Prevents stack
+/// exhaustion or unbounded allocation chains from crafted archives.
+const MAX_MIX_CHAIN_DEPTH: usize = 3;
+
+/// Reads an entry through a chain of nested MIX archives.
+///
+/// For top-level entries (`parent_indices` is empty), this is a simple
+/// `read_by_index`. For nested entries, each parent index is read to obtain
+/// the inner MIX bytes, which are then parsed to reach the next level.
+///
+/// # Safety limits
+///
+/// - Intermediate archives are capped at [`MAX_NESTED_MIX_BYTES`] (64 MB).
+/// - Chain depth is capped at [`MAX_MIX_CHAIN_DEPTH`] (3 levels).
+fn read_mix_chain<R: std::io::Read + std::io::Seek>(
+    reader: &mut ic_cnc_content::cnc_formats::mix::MixArchiveReader<R>,
+    parent_indices: &[usize],
+    leaf_index: usize,
+    entry_path: &str,
+) -> Result<Vec<u8>, PreviewLoadError> {
+    use ic_cnc_content::cnc_formats::mix::MixArchive;
+
+    if parent_indices.len() > MAX_MIX_CHAIN_DEPTH {
+        return Err(PreviewLoadError::EmptyVisual {
+            entry_path: format!("{entry_path} (nesting depth {} exceeds limit {})", parent_indices.len(), MAX_MIX_CHAIN_DEPTH),
+        });
+    }
+
+    if parent_indices.is_empty() {
+        // Top-level entry — direct read.
+        return reader
+            .read_by_index(leaf_index)?
+            .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                entry_path: entry_path.to_string(),
+            });
+    }
+
+    // Walk through the nesting chain. Each parent index yields the bytes of
+    // an inner MIX archive.
+    let mut current_bytes = reader
+        .read_by_index(parent_indices[0])?
+        .ok_or_else(|| PreviewLoadError::EmptyVisual {
+            entry_path: entry_path.to_string(),
+        })?;
+
+    if current_bytes.len() > MAX_NESTED_MIX_BYTES {
+        return Err(PreviewLoadError::EmptyVisual {
+            entry_path: format!("{entry_path} (intermediate MIX {} bytes exceeds {} byte limit)", current_bytes.len(), MAX_NESTED_MIX_BYTES),
+        });
+    }
+
+    for &parent_idx in &parent_indices[1..] {
+        let inner = MixArchive::parse(&current_bytes)?;
+        current_bytes = inner
+            .get_by_index(parent_idx)
+            .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                entry_path: entry_path.to_string(),
+            })?
+            .to_vec();
+
+        if current_bytes.len() > MAX_NESTED_MIX_BYTES {
+            return Err(PreviewLoadError::EmptyVisual {
+                entry_path: format!("{entry_path} (intermediate MIX {} bytes exceeds {} byte limit)", current_bytes.len(), MAX_NESTED_MIX_BYTES),
+            });
+        }
+    }
+
+    // Final level: read the leaf entry from the innermost archive.
+    let inner = MixArchive::parse(&current_bytes)?;
+    inner
+        .get_by_index(leaf_index)
+        .map(|s| s.to_vec())
+        .ok_or_else(|| PreviewLoadError::EmptyVisual {
+            entry_path: entry_path.to_string(),
+        })
+}
+
+/// Loads a leaf entry from a nested MIX chain using seek-based I/O.
+///
+/// Instead of reading an entire intermediate archive into RAM (MOVIES1.MIX
+/// is 369 MB), this opens a bounded `MixEntryReader` window over the nested
+/// archive region and parses only its header + the target entry. Total I/O
+/// is the small MIX header (a few hundred bytes) plus the leaf entry itself.
+///
+/// This matches how the original Red Alert engine accessed nested MIX files
+/// on hardware with 16 MB of RAM — pure offset arithmetic and seeks, never
+/// materialising intermediate archives.
+fn load_nested_mix_entry(
+    archive_path: &std::path::Path,
+    parent_indices: &[usize],
+    leaf_index: usize,
+    entry_path: &str,
+    _cache: Option<&super::ArchivePreloadCache>,
+    handles: Option<&super::ArchiveHandleCache>,
+) -> Result<Vec<u8>, PreviewLoadError> {
+    use ic_cnc_content::cnc_formats::mix::MixArchiveReader;
+
+    if parent_indices.len() > MAX_MIX_CHAIN_DEPTH {
+        return Err(PreviewLoadError::EmptyVisual {
+            entry_path: format!("{entry_path} (nesting depth {} exceeds limit {})", parent_indices.len(), MAX_MIX_CHAIN_DEPTH),
+        });
+    }
+
+    // Obtain a persistent handle for the outer archive.
+    if let Some(handle_cache) = handles {
+        if let Ok(handle) = handle_cache.get_or_open_mix(archive_path) {
+            let mut outer = handle.lock().unwrap_or_else(|e| e.into_inner());
+            return read_nested_via_seek(&mut *outer, parent_indices, leaf_index, entry_path);
+        }
+    }
+
+    // Fallback: open a fresh reader.
+    let file = fs::File::open(archive_path)?;
+    let mut outer = MixArchiveReader::open(std::io::BufReader::new(file))?;
+    read_nested_via_seek(&mut outer, parent_indices, leaf_index, entry_path)
+}
+
+/// Walks the nesting chain using bounded entry readers (no bulk allocation).
+///
+/// For a single level of nesting (the common case), this opens a
+/// `MixEntryReader` over the intermediate archive's byte range, then opens
+/// a nested `MixArchiveReader` on that window. The nested reader parses
+/// only the small CRC index header and seeks directly to the leaf entry.
+fn read_nested_via_seek<R: std::io::Read + std::io::Seek>(
+    outer: &mut ic_cnc_content::cnc_formats::mix::MixArchiveReader<R>,
+    parent_indices: &[usize],
+    leaf_index: usize,
+    entry_path: &str,
+) -> Result<Vec<u8>, PreviewLoadError> {
+    use ic_cnc_content::cnc_formats::mix::MixArchiveReader;
+
+    // Open a bounded reader over the first intermediate archive.
+    let mut entry_reader = outer
+        .open_entry_by_index(parent_indices[0])?
+        .ok_or_else(|| PreviewLoadError::EmptyVisual {
+            entry_path: entry_path.to_string(),
+        })?;
+
+    if parent_indices.len() == 1 {
+        // Common case: one level of nesting (e.g. MAIN.MIX::MOVIES1.MIX::PROLOG.VQA).
+        // Parse the intermediate header directly from the bounded reader
+        // and read only the leaf entry bytes.
+        let mut inner = MixArchiveReader::open(&mut entry_reader)?;
+        return inner
+            .read_by_index(leaf_index)?
+            .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                entry_path: entry_path.to_string(),
+            });
+    }
+
+    // Rare case: deeper nesting (3+ levels). We must materialise each
+    // intermediate level because MixEntryReader borrows its parent reader,
+    // preventing simultaneous nesting of entry readers.
+    let mut current_bytes = {
+        let mut buf = Vec::with_capacity(entry_reader.len() as usize);
+        std::io::Read::read_to_end(&mut entry_reader, &mut buf)?;
+        buf
+    };
+
+    if current_bytes.len() > MAX_NESTED_MIX_BYTES {
+        return Err(PreviewLoadError::EmptyVisual {
+            entry_path: format!("{entry_path} (intermediate MIX {} bytes exceeds {} byte limit)", current_bytes.len(), MAX_NESTED_MIX_BYTES),
+        });
+    }
+
+    for &parent_idx in &parent_indices[1..] {
+        let cursor = std::io::Cursor::new(&current_bytes);
+        let mut reader = MixArchiveReader::open(cursor)?;
+        current_bytes = reader
+            .read_by_index(parent_idx)?
+            .ok_or_else(|| PreviewLoadError::EmptyVisual {
+                entry_path: entry_path.to_string(),
+            })?;
+
+        if current_bytes.len() > MAX_NESTED_MIX_BYTES {
+            return Err(PreviewLoadError::EmptyVisual {
+                entry_path: format!("{entry_path} (intermediate MIX {} bytes exceeds {} byte limit)", current_bytes.len(), MAX_NESTED_MIX_BYTES),
+            });
+        }
+    }
+
+    let cursor = std::io::Cursor::new(&current_bytes);
+    let mut reader = MixArchiveReader::open(cursor)?;
+    reader
+        .read_by_index(leaf_index)?
+        .ok_or_else(|| PreviewLoadError::EmptyVisual {
+            entry_path: entry_path.to_string(),
+        })
 }
 
 fn load_shp_preview(
@@ -1310,7 +1559,7 @@ fn preferred_palette_names_for_visual(entry: &ContentCatalogEntry) -> &'static [
     }
 }
 
-fn entry_extension_lower(entry: &ContentCatalogEntry) -> Option<String> {
+pub(crate) fn entry_extension_lower(entry: &ContentCatalogEntry) -> Option<String> {
     let name = entry
         .location
         .logical_name()

@@ -208,6 +208,7 @@ pub(crate) fn refresh_content_gallery(
     mut preview_tracker: ResMut<ContentPreviewTracker>,
     mut gallery_tracker: ResMut<ContentGalleryTracker>,
     archive_cache: Res<super::ArchivePreloadCache>,
+    handle_cache: Res<super::ArchiveHandleCache>,
     gallery_root_query: Query<Entity, With<ContentGalleryRoot>>,
     inspector_root_query: Query<Entity, With<ContentInspectorRoot>>,
     existing_transient_query: Query<Entity, With<ContentGalleryTransient>>,
@@ -244,6 +245,7 @@ pub(crate) fn refresh_content_gallery(
         &preview_tracker,
         &mut gallery_tracker,
         &archive_cache,
+        &handle_cache,
     );
     let inspector_spec = build_inspector_spec(state.selected_entry(), &preview_tracker);
 
@@ -535,6 +537,7 @@ fn build_tile_specs(
     preview_tracker: &ContentPreviewTracker,
     gallery_tracker: &mut ContentGalleryTracker,
     archive_cache: &super::ArchivePreloadCache,
+    handle_cache: &super::ArchiveHandleCache,
 ) -> Vec<TileUiSpec> {
     let Some(catalog) = catalogs.get(gallery_window.catalog_index) else {
         return Vec::new();
@@ -561,7 +564,7 @@ fn build_tile_specs(
                     }),
                 )
             } else {
-                build_static_thumbnail(entry, catalogs, images, gallery_tracker, archive_cache)
+                build_static_thumbnail(entry, catalogs, images, gallery_tracker, archive_cache, handle_cache)
             };
 
             Some(TileUiSpec {
@@ -581,13 +584,14 @@ fn build_static_thumbnail(
     images: &mut Assets<Image>,
     gallery_tracker: &mut ContentGalleryTracker,
     archive_cache: &super::ArchivePreloadCache,
+    handle_cache: &super::ArchiveHandleCache,
 ) -> (Option<Handle<Image>>, Option<ContainedImageSize>) {
     // Videos are too expensive to decode synchronously for thumbnails.
     // The selected entry uses the streaming preview tracker instead.
-    if super::preview::should_background_load_preview_for_family(entry.family) {
+    if super::preview::should_background_load_preview(entry) {
         return (None, None);
     }
-    match load_preview_for_entry(entry, catalogs, Some(archive_cache)) {
+    match load_preview_for_entry(entry, catalogs, Some(archive_cache), Some(handle_cache)) {
         Ok(Some(preview)) => preview.visual().map_or((None, None), |visual| {
             let Some(first_frame) = visual.frames().first() else {
                 return (None, None);

@@ -14,7 +14,7 @@
 //! preview a SHP, inspect a palette, play an AUD, decode a VQA, and so on.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -84,6 +84,129 @@ pub(crate) struct ArchivePreloadCache {
     pub(crate) archives: Arc<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>>,
 }
 
+/// Persistent archive handle cache.
+///
+/// Keeps parsed `MixArchiveReader` / `MegArchiveReader` handles open for the
+/// session so that browsing entries inside a MIX only pays the index-parse cost
+/// once. Subsequent reads are a cheap seek + read.
+///
+/// Each reader is individually `Mutex`-wrapped so concurrent systems (e.g. the
+/// VQA streaming thread and the main preview system) only block when accessing
+/// the *same* archive file.
+#[derive(Resource, Clone, Default)]
+pub(crate) struct ArchiveHandleCache {
+    mix_handles: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<ic_cnc_content::cnc_formats::mix::MixArchiveReader<std::io::BufReader<std::fs::File>>>>>>>,
+    meg_handles: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<ic_cnc_content::cnc_formats::meg::MegArchiveReader<std::io::BufReader<std::fs::File>>>>>>>,
+}
+
+impl ArchiveHandleCache {
+    /// Returns a persistent MIX reader handle, opening the archive on first access.
+    pub(crate) fn get_or_open_mix(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Arc<Mutex<ic_cnc_content::cnc_formats::mix::MixArchiveReader<std::io::BufReader<std::fs::File>>>>, ic_cnc_content::cnc_formats::Error> {
+        use ic_cnc_content::cnc_formats::mix::MixArchiveReader;
+
+        let mut map = self.mix_handles.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = map.get(path) {
+            return Ok(Arc::clone(handle));
+        }
+        let file = std::fs::File::open(path).map_err(|e| ic_cnc_content::cnc_formats::Error::Io {
+            context: "opening MIX archive for handle cache",
+            kind: e.kind(),
+        })?;
+        let reader = MixArchiveReader::open(std::io::BufReader::new(file))?;
+        let handle = Arc::new(Mutex::new(reader));
+        map.insert(path.to_path_buf(), Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    /// Returns a persistent MEG reader handle, opening the archive on first access.
+    pub(crate) fn get_or_open_meg(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Arc<Mutex<ic_cnc_content::cnc_formats::meg::MegArchiveReader<std::io::BufReader<std::fs::File>>>>, ic_cnc_content::cnc_formats::Error> {
+        use ic_cnc_content::cnc_formats::meg::MegArchiveReader;
+
+        let mut map = self.meg_handles.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = map.get(path) {
+            return Ok(Arc::clone(handle));
+        }
+        let file = std::fs::File::open(path).map_err(|e| ic_cnc_content::cnc_formats::Error::Io {
+            context: "opening MEG archive for handle cache",
+            kind: e.kind(),
+        })?;
+        let reader = MegArchiveReader::open(std::io::BufReader::new(file))?;
+        let handle = Arc::new(Mutex::new(reader));
+        map.insert(path.to_path_buf(), Arc::clone(&handle));
+        Ok(handle)
+    }
+
+}
+
+/// Virtual filesystem overlay built from all mounted MIX archives.
+///
+/// Uses cnc-formats' `MixOverlayIndex` to provide last-mounted-wins filename
+/// resolution across all discovered MIX archives, matching the original game's
+/// global `Retrieve("filename")` registry pattern.
+#[derive(Resource, Clone, Default)]
+pub(crate) struct MixVfs {
+    overlay: ic_cnc_content::cnc_formats::mix::MixOverlayIndex<PathBuf>,
+}
+
+impl MixVfs {
+    /// Resolves a filename across all mounted MIX archives.
+    ///
+    /// Returns the archive path and entry index of the winning entry.
+    #[allow(dead_code)]
+    pub(crate) fn resolve_name(&self, filename: &str) -> Option<(&Path, usize)> {
+        self.overlay.resolve_name(filename).map(|record| {
+            (record.source.as_path(), record.entry_index)
+        })
+    }
+
+    /// Returns the number of unique CRCs in the overlay.
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.overlay.len()
+    }
+}
+
+/// Builds a `MixVfs` from finished catalog scan results.
+fn build_mix_vfs(catalogs: &[ContentCatalog]) -> MixVfs {
+    use ic_cnc_content::cnc_formats::mix::{MixArchiveReader, MixOverlayIndex};
+
+    let mut overlay = MixOverlayIndex::new();
+
+    // Collect unique MIX archive paths from the catalogs.
+    let mut seen_archives: Vec<PathBuf> = Vec::new();
+    for catalog in catalogs {
+        for entry in &catalog.entries {
+            if let ContentEntryLocation::MixMember { archive_path, parent_indices, .. } = &entry.location {
+                // Only mount top-level archives (not nested ones — their entries
+                // are already flattened into the catalog with parent_indices).
+                if parent_indices.is_empty() && !seen_archives.contains(archive_path) {
+                    seen_archives.push(archive_path.clone());
+                }
+            }
+        }
+    }
+
+    for archive_path in &seen_archives {
+        let file = match std::fs::File::open(archive_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = match MixArchiveReader::open(std::io::BufReader::new(file)) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        overlay.mount_archive(archive_path.clone(), reader.entries());
+    }
+
+    MixVfs { overlay }
+}
+
 #[derive(Resource)]
 struct ContentCatalogScanTask {
     receiver: Mutex<Receiver<Vec<ContentCatalog>>>,
@@ -125,6 +248,8 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
         .insert_resource(content_state)
         .insert_resource(scan_task)
         .insert_resource(archive_cache)
+        .insert_resource(ArchiveHandleCache::default())
+        .insert_resource(MixVfs::default())
         .insert_resource(PlaybackSettings(options.config.playback.clone()))
         .insert_resource(AudioSettings(options.config.audio.clone()))
         .insert_resource(EscapeExitShortcut::default())
@@ -312,7 +437,13 @@ fn poll_content_catalog_scan(
 
     match receiver.try_recv() {
         Ok(catalogs) => {
+            let vfs = build_mix_vfs(&catalogs);
+            eprintln!(
+                "[vfs] MIX overlay built: {} unique CRCs across mounted archives",
+                vfs.len()
+            );
             state.replace_catalogs(catalogs);
+            commands.insert_resource(vfs);
             commands.remove_resource::<ContentCatalogScanTask>();
         }
         Err(mpsc::TryRecvError::Empty) => {}

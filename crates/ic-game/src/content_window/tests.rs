@@ -264,15 +264,40 @@ fn video_preview_surface_policy_uses_movie_mode_budget() {
 ///
 /// `cnc-formats` currently exposes whole-file VQA decode, so the best local
 /// runtime policy is to move that work off the main thread while keeping the
-/// UI responsive. Static art still stays on the simpler immediate path.
+/// UI responsive. Static art, VQP palette tables, and WSA animations still
+/// use the simpler immediate path.
 #[test]
 fn video_preview_policy_uses_background_loading() {
-    assert!(super::preview::should_background_load_preview_for_family(
-        ContentFamily::Video
-    ));
-    assert!(!super::preview::should_background_load_preview_for_family(
-        ContentFamily::SpriteSheet
-    ));
+    let vqa_entry = ContentCatalogEntry {
+        relative_path: "MOVIE.VQA".into(),
+        location: ContentEntryLocation::Filesystem {
+            absolute_path: PathBuf::from("/dummy/MOVIE.VQA"),
+        },
+        size_bytes: 100,
+        family: ContentFamily::Video,
+        support: ContentSupportLevel::SupportedNow,
+    };
+    let vqp_entry = ContentCatalogEntry {
+        relative_path: "TABLE.VQP".into(),
+        location: ContentEntryLocation::Filesystem {
+            absolute_path: PathBuf::from("/dummy/TABLE.VQP"),
+        },
+        size_bytes: 100,
+        family: ContentFamily::Video,
+        support: ContentSupportLevel::SupportedNow,
+    };
+    let shp_entry = ContentCatalogEntry {
+        relative_path: "UNIT.SHP".into(),
+        location: ContentEntryLocation::Filesystem {
+            absolute_path: PathBuf::from("/dummy/UNIT.SHP"),
+        },
+        size_bytes: 100,
+        family: ContentFamily::SpriteSheet,
+        support: ContentSupportLevel::SupportedNow,
+    };
+    assert!(super::preview::should_background_load_preview(&vqa_entry));
+    assert!(!super::preview::should_background_load_preview(&vqp_entry));
+    assert!(!super::preview::should_background_load_preview(&shp_entry));
 }
 
 /// Proves that the fullscreen content lab does not exit on a single accidental
@@ -671,7 +696,7 @@ fn sprite_preview_loads_real_shp_and_palette_bytes() {
     };
 
     let preview =
-        super::preview::load_preview_for_entry(&entry, &[sprite_catalog, palette_catalog], None)
+        super::preview::load_preview_for_entry(&entry, &[sprite_catalog, palette_catalog], None, None)
             .expect("preview loading should succeed")
             .expect("sprite sheets are previewable");
 
@@ -718,7 +743,7 @@ fn sprite_preview_loads_real_shp_and_palette_bytes_from_mix_members() {
         .cloned()
         .expect("the mounted MIX sprite member should exist");
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[catalog], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[catalog], None, None)
         .expect("archive-member preview loading should succeed")
         .expect("sprite sheets are previewable");
 
@@ -753,7 +778,7 @@ fn palette_preview_builds_a_visible_swatch_grid() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None, None)
         .expect("palette preview loading should succeed")
         .expect("palettes are previewable");
 
@@ -785,7 +810,7 @@ fn aud_preview_builds_waveform_and_direct_pcm_payload() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None, None)
         .expect("AUD preview loading should succeed")
         .expect("AUD resources are previewable");
 
@@ -847,7 +872,7 @@ fn wsa_preview_decodes_multiple_frames_with_external_palette() {
     };
 
     let preview =
-        super::preview::load_preview_for_entry(&entry, &[visual_catalog, palette_catalog], None)
+        super::preview::load_preview_for_entry(&entry, &[visual_catalog, palette_catalog], None, None)
             .expect("WSA preview loading should succeed")
             .expect("WSA resources are previewable");
 
@@ -875,7 +900,7 @@ fn text_preview_surfaces_config_excerpt() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None, None)
         .expect("text preview loading should succeed")
         .expect("config files are previewable");
 
@@ -902,7 +927,7 @@ fn vqa_preview_surfaces_video_frames_and_audio() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None, None)
         .expect("VQA preview loading should succeed")
         .expect("VQA resources are previewable");
 
@@ -1230,7 +1255,7 @@ fn waveform_handles_i16_min_without_overflow() {
     };
 
     // This must not panic with "attempt to negate with overflow".
-    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None, None)
         .expect("WAV preview should succeed")
         .expect("WAV files are previewable");
     assert!(
@@ -1343,7 +1368,7 @@ fn aud_scomp_sos_decodes_without_chunk_header_corruption() {
         support: ContentSupportLevel::SupportedNow,
     };
 
-    let preview = super::preview::load_preview_for_entry(&entry, &[], None)
+    let preview = super::preview::load_preview_for_entry(&entry, &[], None, None)
         .expect("SCOMP_SOS AUD preview loading should succeed")
         .expect("AUD resources are previewable");
 
@@ -1495,7 +1520,25 @@ fn test_vqa_bytes() -> Vec<u8> {
     .expect("synthetic VQA fixture should encode")
 }
 
+/// Builds a MIX archive with an embedded XCC local mix database (LMD) so
+/// that logical filenames are recoverable during catalog scanning.
 fn build_named_mix(files: &[(&str, &[u8])]) -> Vec<u8> {
+    // Build the LMD entry so embedded_names() resolves logical filenames.
+    let lmd_data = build_lmd(files.iter().map(|(name, _)| *name));
+    let lmd_name = "local mix database.dat";
+
+    // Combine user files + LMD entry.
+    let all_files: Vec<(&str, &[u8])> = files
+        .iter()
+        .copied()
+        .chain(std::iter::once((lmd_name, lmd_data.as_slice())))
+        .collect();
+
+    build_raw_mix(&all_files)
+}
+
+/// Builds a MIX archive without an LMD entry (raw CRC-only entries).
+fn build_raw_mix(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();
     let payload_size = files
         .iter()
@@ -1522,6 +1565,44 @@ fn build_named_mix(files: &[(&str, &[u8])]) -> Vec<u8> {
     }
 
     bytes
+}
+
+/// Builds an XCC local mix database (LMD) blob from a list of filenames.
+fn build_lmd<'a>(names: impl Iterator<Item = &'a str>) -> Vec<u8> {
+    let names: Vec<&str> = names.collect();
+    let mut data = Vec::new();
+    data.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for name in &names {
+        data.extend_from_slice(name.as_bytes());
+        data.push(0); // NUL-terminated name
+        data.push(0); // NUL-terminated description (empty)
+    }
+    data
+}
+
+/// Finds the CRC-sorted index of a named entry in raw MIX bytes.
+///
+/// `MixArchiveReader` sorts entries by CRC after parsing, so the position
+/// returned here matches `read_by_index`.
+fn find_mix_entry_index(mix_bytes: &[u8], name: &str) -> usize {
+    let target_crc = ic_cnc_content::cnc_formats::mix::crc(name).to_raw();
+    let count = u16::from_le_bytes([mix_bytes[0], mix_bytes[1]]) as usize;
+    // Header: 2 (count) + 4 (payload_size) = 6 bytes, then 12 bytes per entry.
+    let mut crcs: Vec<u32> = (0..count)
+        .map(|i| {
+            let base = 6 + i * 12;
+            u32::from_le_bytes([
+                mix_bytes[base],
+                mix_bytes[base + 1],
+                mix_bytes[base + 2],
+                mix_bytes[base + 3],
+            ])
+        })
+        .collect();
+    crcs.sort();
+    crcs.iter()
+        .position(|&c| c == target_crc)
+        .unwrap_or_else(|| panic!("CRC for '{name}' not found in MIX archive"))
 }
 
 fn build_meg(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1599,4 +1680,413 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+// ── Persistent archive handle cache ─────────────────────────────────────────
+
+/// Proves that `ArchiveHandleCache` opens a MIX handle on first access and
+/// returns the same handle on subsequent calls without re-opening the file.
+#[test]
+fn archive_handle_cache_returns_persistent_mix_handle() {
+    let fixture = TestDir::new("handle_cache_persistent");
+    let mix_path = fixture.write_file(
+        "TEST.MIX",
+        &build_named_mix(&[("FILE.BIN", b"hello")]),
+    );
+
+    let cache = super::ArchiveHandleCache::default();
+
+    // First call opens the file and parses the index.
+    let handle1 = cache
+        .get_or_open_mix(&mix_path)
+        .expect("first open should succeed");
+
+    // Second call should return the same Arc (cache hit).
+    let handle2 = cache
+        .get_or_open_mix(&mix_path)
+        .expect("second open should succeed");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&handle1, &handle2),
+        "repeated calls must return the same cached handle, not re-open the file"
+    );
+
+    // The cached reader should still be functional.
+    let mix_bytes = build_named_mix(&[("FILE.BIN", b"hello")]);
+    let idx = find_mix_entry_index(&mix_bytes, "FILE.BIN");
+    let mut reader = handle1.lock().unwrap();
+    let data = reader
+        .read_by_index(idx)
+        .expect("read should succeed")
+        .expect("entry should exist");
+    assert_eq!(data, b"hello");
+}
+
+/// Proves that `ArchiveHandleCache` returns an error for a non-existent file
+/// rather than panicking.
+#[test]
+fn archive_handle_cache_returns_error_for_missing_file() {
+    let cache = super::ArchiveHandleCache::default();
+    let result = cache.get_or_open_mix(std::path::Path::new("/no/such/file.mix"));
+    assert!(result.is_err(), "opening a non-existent file should fail gracefully");
+}
+
+/// Proves that `ArchiveHandleCache` can serve multiple threads concurrently
+/// without panicking or returning corrupt data.
+#[test]
+fn archive_handle_cache_concurrent_access() {
+    let fixture = TestDir::new("handle_cache_concurrent");
+    let mix_path = fixture.write_file(
+        "SHARED.MIX",
+        &build_named_mix(&[("DATA.BIN", b"concurrent-ok")]),
+    );
+
+    let cache = super::ArchiveHandleCache::default();
+    let mut threads = Vec::new();
+
+    let mix_bytes = build_named_mix(&[("DATA.BIN", b"concurrent-ok")]);
+    let idx = find_mix_entry_index(&mix_bytes, "DATA.BIN");
+
+    for _ in 0..4 {
+        let cache_clone = cache.clone();
+        let path_clone = mix_path.clone();
+        threads.push(std::thread::spawn(move || {
+            let handle = cache_clone
+                .get_or_open_mix(&path_clone)
+                .expect("concurrent open should succeed");
+            let mut reader = handle.lock().unwrap();
+            let data = reader
+                .read_by_index(idx)
+                .expect("read should succeed")
+                .expect("entry should exist");
+            assert_eq!(data, b"concurrent-ok");
+        }));
+    }
+
+    for thread in threads {
+        thread.join().expect("thread should not panic");
+    }
+}
+
+// ── Recursive MIX mounting ──────────────────────────────────────────────────
+
+/// Proves that a MIX archive containing an inner MIX archive has both
+/// levels of entries cataloged with correct `parent_indices` and
+/// `relative_path` chains.
+#[test]
+fn mount_nested_mix_creates_entries_with_parent_indices() {
+    let fixture = TestDir::new("nested_mix_mount");
+    let inner_mix = build_named_mix(&[
+        ("INNER_FILE.BIN", b"inner-data"),
+    ]);
+    fixture.write_file(
+        "OUTER.MIX",
+        &build_named_mix(&[
+            ("CONQUER.MIX", &inner_mix),
+            ("TOP_LEVEL.BIN", b"top-level-data"),
+        ]),
+    );
+
+    let source = ContentSourceRoot::directory(
+        "Nested MIX Root",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let catalog = ContentCatalog::scan(source);
+
+    assert!(catalog.available);
+
+    // Should have: OUTER.MIX, CONQUER.MIX member, TOP_LEVEL.BIN member,
+    // and INNER_FILE.BIN nested inside CONQUER.MIX.
+    let nested_entry = catalog
+        .entries
+        .iter()
+        .find(|e| e.relative_path.contains("INNER_FILE.BIN"))
+        .expect("nested inner file should be cataloged");
+
+    assert!(
+        nested_entry.relative_path.contains("CONQUER.MIX::"),
+        "relative path should show the nesting chain: {}",
+        nested_entry.relative_path
+    );
+
+    match &nested_entry.location {
+        ContentEntryLocation::MixMember { parent_indices, .. } => {
+            assert!(
+                !parent_indices.is_empty(),
+                "nested entries must have non-empty parent_indices"
+            );
+        }
+        other => panic!("expected MixMember, got {other:?}"),
+    }
+}
+
+/// Proves that recursion stops at the configured depth limit, preventing
+/// zip-bomb style attacks with deeply nested MIX-within-MIX archives.
+#[test]
+fn mount_nested_mix_stops_at_max_depth() {
+    // Build 5 levels deep: L0 → L1 → L2 → L3 → L4 → DEEP.BIN
+    // Only 3 levels of nesting should be mounted (MAX_NESTING_DEPTH = 3).
+    let level4 = build_named_mix(&[("DEEP.BIN", b"too-deep")]);
+    let level3 = build_named_mix(&[("LEVEL4.MIX", &level4)]);
+    let level2 = build_named_mix(&[("LEVEL3.MIX", &level3)]);
+    let level1 = build_named_mix(&[("LEVEL2.MIX", &level2)]);
+    let level0 = build_named_mix(&[("LEVEL1.MIX", &level1)]);
+
+    let fixture = TestDir::new("nested_mix_depth_limit");
+    fixture.write_file("DEEP.MIX", &level0);
+
+    let source = ContentSourceRoot::directory(
+        "Deep Nesting",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let catalog = ContentCatalog::scan(source);
+
+    // DEEP.BIN at level 4 should NOT appear — only 3 levels of nesting allowed.
+    let has_deep = catalog
+        .entries
+        .iter()
+        .any(|e| e.relative_path.contains("DEEP.BIN"));
+    assert!(
+        !has_deep,
+        "entries beyond MAX_NESTING_DEPTH should not be cataloged; \
+         found DEEP.BIN despite being 4 levels deep"
+    );
+
+    // But level 3 (LEVEL4.MIX) should appear as a WestwoodArchive entry.
+    let has_level4 = catalog
+        .entries
+        .iter()
+        .any(|e| e.relative_path.contains("LEVEL4.MIX"));
+    assert!(
+        has_level4,
+        "entries at the depth boundary (level 3) should still be cataloged"
+    );
+}
+
+// ── Three-tier entry loading ────────────────────────────────────────────────
+
+/// Proves that `load_entry_bytes_cached` reads a top-level MIX member using
+/// the persistent handle cache (tier 2) when no RAM cache is available.
+#[test]
+fn load_entry_bytes_tier2_persistent_handle() {
+    let fixture = TestDir::new("tier2_load");
+    let mix_bytes = build_named_mix(&[("PAYLOAD.BIN", b"tier2-payload")]);
+    let mix_path = fixture.write_file("ARCHIVE.MIX", &mix_bytes);
+
+    let archive_index = find_mix_entry_index(&mix_bytes, "PAYLOAD.BIN");
+    let handle_cache = super::ArchiveHandleCache::default();
+    let entry = ContentCatalogEntry {
+        relative_path: "ARCHIVE.MIX::PAYLOAD.BIN".into(),
+        location: ContentEntryLocation::MixMember {
+            archive_path: mix_path,
+            archive_index,
+            crc_raw: ic_cnc_content::cnc_formats::mix::crc("PAYLOAD.BIN").to_raw(),
+            logical_name: Some("PAYLOAD.BIN".into()),
+            parent_indices: vec![],
+        },
+        size_bytes: 13,
+        family: ContentFamily::Other,
+        support: ContentSupportLevel::Planned,
+    };
+
+    let bytes = super::preview_decode::load_entry_bytes_cached(&entry, None, Some(&handle_cache))
+        .expect("tier 2 load should succeed");
+    assert_eq!(bytes, b"tier2-payload");
+}
+
+/// Proves that `load_entry_bytes_cached` falls back to direct disk I/O
+/// (tier 3) when neither the RAM cache nor the handle cache is provided.
+#[test]
+fn load_entry_bytes_tier3_disk_fallback() {
+    let fixture = TestDir::new("tier3_load");
+    let mix_bytes = build_named_mix(&[("DATA.BIN", b"disk-fallback")]);
+    let mix_path = fixture.write_file("FALLBACK.MIX", &mix_bytes);
+
+    let archive_index = find_mix_entry_index(&mix_bytes, "DATA.BIN");
+    let entry = ContentCatalogEntry {
+        relative_path: "FALLBACK.MIX::DATA.BIN".into(),
+        location: ContentEntryLocation::MixMember {
+            archive_path: mix_path,
+            archive_index,
+            crc_raw: ic_cnc_content::cnc_formats::mix::crc("DATA.BIN").to_raw(),
+            logical_name: Some("DATA.BIN".into()),
+            parent_indices: vec![],
+        },
+        size_bytes: 13,
+        family: ContentFamily::Other,
+        support: ContentSupportLevel::Planned,
+    };
+
+    let bytes = super::preview_decode::load_entry_bytes_cached(&entry, None, None)
+        .expect("tier 3 disk fallback should succeed");
+    assert_eq!(bytes, b"disk-fallback");
+}
+
+// ── Nested MIX entry extraction ─────────────────────────────────────────────
+
+/// Proves that `load_entry_bytes_cached` can extract a file from a nested
+/// MIX archive using the `parent_indices` chain.
+#[test]
+fn load_entry_bytes_nested_mix_chain() {
+    let inner_mix = build_named_mix(&[("NESTED.BIN", b"nested-payload")]);
+    let outer_mix = build_named_mix(&[("INNER.MIX", &inner_mix)]);
+
+    let fixture = TestDir::new("nested_mix_load");
+    let mix_path = fixture.write_file("OUTER.MIX", &outer_mix);
+
+    // We need to figure out what archive_index the inner entry gets after
+    // CRC-sorted parsing. Open the outer, find INNER.MIX's index.
+    let file = std::fs::File::open(&mix_path).unwrap();
+    let mut reader =
+        ic_cnc_content::cnc_formats::mix::MixArchiveReader::open(std::io::BufReader::new(file))
+            .unwrap();
+    let inner_crc = ic_cnc_content::cnc_formats::mix::crc("INNER.MIX");
+    let outer_index = reader
+        .entries()
+        .iter()
+        .position(|e| e.crc == inner_crc)
+        .expect("INNER.MIX should exist in OUTER.MIX");
+
+    // Read INNER.MIX bytes to find the sorted index of NESTED.BIN.
+    let inner_bytes = reader.read_by_index(outer_index).unwrap().unwrap();
+    let inner_archive = ic_cnc_content::cnc_formats::mix::MixArchive::parse(&inner_bytes).unwrap();
+    let nested_crc = ic_cnc_content::cnc_formats::mix::crc("NESTED.BIN");
+    let inner_index = inner_archive
+        .entries()
+        .iter()
+        .position(|e| e.crc == nested_crc)
+        .expect("NESTED.BIN should exist in INNER.MIX");
+    drop(reader);
+
+    let entry = ContentCatalogEntry {
+        relative_path: "OUTER.MIX::INNER.MIX::NESTED.BIN".into(),
+        location: ContentEntryLocation::MixMember {
+            archive_path: mix_path,
+            archive_index: inner_index,
+            crc_raw: nested_crc.to_raw(),
+            logical_name: Some("NESTED.BIN".into()),
+            parent_indices: vec![outer_index],
+        },
+        size_bytes: 14,
+        family: ContentFamily::Other,
+        support: ContentSupportLevel::Planned,
+    };
+
+    let handle_cache = super::ArchiveHandleCache::default();
+    let bytes = super::preview_decode::load_entry_bytes_cached(&entry, None, Some(&handle_cache))
+        .expect("nested MIX chain read should succeed");
+    assert_eq!(bytes, b"nested-payload");
+}
+
+/// Proves that the nesting depth guard in `read_mix_chain` rejects chains
+/// deeper than `MAX_MIX_CHAIN_DEPTH`, even when `parent_indices` is
+/// artificially extended.
+#[test]
+fn read_mix_chain_rejects_excessive_depth() {
+    let mix = build_named_mix(&[("FILE.BIN", b"data")]);
+    let fixture = TestDir::new("chain_depth_guard");
+    let mix_path = fixture.write_file("GUARDED.MIX", &mix);
+
+    // parent_indices with 4 entries exceeds MAX_MIX_CHAIN_DEPTH (3).
+    let entry = ContentCatalogEntry {
+        relative_path: "GUARDED.MIX::deeply::nested::FILE.BIN".into(),
+        location: ContentEntryLocation::MixMember {
+            archive_path: mix_path,
+            archive_index: 0,
+            crc_raw: 0,
+            logical_name: None,
+            parent_indices: vec![0, 0, 0, 0],
+        },
+        size_bytes: 4,
+        family: ContentFamily::Other,
+        support: ContentSupportLevel::Planned,
+    };
+
+    let result = super::preview_decode::load_entry_bytes_cached(&entry, None, None);
+    assert!(
+        result.is_err(),
+        "chains deeper than MAX_MIX_CHAIN_DEPTH must be rejected"
+    );
+}
+
+// ── MixVfs overlay ──────────────────────────────────────────────────────────
+
+/// Proves that `build_mix_vfs` mounts archives from catalogs and supports
+/// filename resolution across them.
+#[test]
+fn mix_vfs_resolves_filenames_across_mounted_archives() {
+    let fixture = TestDir::new("mix_vfs_resolve");
+    let mix_path = fixture.write_file(
+        "GAME.MIX",
+        &build_named_mix(&[
+            ("RULES.INI", b"rules-content"),
+            ("TEMPERAT.PAL", b"palette-content"),
+        ]),
+    );
+
+    let source = ContentSourceRoot::directory(
+        "VFS Root",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let catalogs = vec![ContentCatalog::scan(source)];
+    let vfs = super::build_mix_vfs(&catalogs);
+
+    assert!(vfs.len() > 0, "VFS should contain mounted entries");
+
+    let resolved = vfs.resolve_name("RULES.INI");
+    assert!(resolved.is_some(), "RULES.INI should be resolvable in the VFS");
+    let (source_path, _index) = resolved.unwrap();
+    assert_eq!(source_path, mix_path.as_path());
+}
+
+/// Proves that `build_mix_vfs` uses last-mounted-wins when the same filename
+/// exists in multiple archives.
+#[test]
+fn mix_vfs_last_mounted_wins() {
+    let fixture = TestDir::new("mix_vfs_priority");
+    fixture.write_file(
+        "FIRST.MIX",
+        &build_named_mix(&[("SHARED.INI", b"first-content")]),
+    );
+    let second_path = fixture.write_file(
+        "SECOND.MIX",
+        &build_named_mix(&[("SHARED.INI", b"second-content")]),
+    );
+
+    let source = ContentSourceRoot::directory(
+        "Priority Root",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let catalogs = vec![ContentCatalog::scan(source)];
+    let vfs = super::build_mix_vfs(&catalogs);
+
+    let resolved = vfs
+        .resolve_name("SHARED.INI")
+        .expect("SHARED.INI should be resolvable");
+    // The second archive should win because it was mounted later.
+    let (source_path, _) = resolved;
+    assert_eq!(
+        source_path,
+        second_path.as_path(),
+        "later-mounted archive should take priority"
+    );
+}
+
+/// Proves that `MixVfs::resolve_name` returns `None` for filenames not
+/// present in any mounted archive.
+#[test]
+fn mix_vfs_returns_none_for_unknown_filenames() {
+    let vfs = super::MixVfs::default();
+    assert!(
+        vfs.resolve_name("NONEXISTENT.FILE").is_none(),
+        "unknown filenames should resolve to None"
+    );
 }
