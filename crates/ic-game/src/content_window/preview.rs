@@ -244,6 +244,16 @@ pub(crate) struct VisualPreviewSession {
     /// Used for accurate frame count reporting even when old frames are
     /// evicted from the sliding window.
     total_frames_decoded: usize,
+    /// Compact palette-indexed frames for VQA streaming (1 byte/pixel +
+    /// 768-byte palette, ~4× smaller than RGBA).  When present, these
+    /// are the authoritative frame data; `frames` holds at most the
+    /// **current display frame** converted to RGBA on demand.
+    indexed_frames: Vec<super::vqa_stream::IndexedFrame>,
+    /// Cached RGBA for the current indexed frame.  Populated by
+    /// `select_frame` and `push_indexed_frames` whenever the cursor moves
+    /// to an indexed frame (local index ≥ 1).  `None` means the cursor is
+    /// at local index 0 — the initial RGBA frame stored in `frames[0]`.
+    current_rgba: Option<ic_render::sprite::RgbaSpriteFrame>,
 }
 
 /// Maximum number of decoded RGBA frames kept in the sliding window.
@@ -273,6 +283,8 @@ impl VisualPreviewSession {
             current_frame: 0,
             frame_duration_seconds,
             total_frames_decoded: total,
+            indexed_frames: Vec::new(),
+            current_rgba: None,
         })
     }
 
@@ -283,7 +295,12 @@ impl VisualPreviewSession {
 
     /// Number of frames currently held in the sliding window buffer.
     pub(crate) fn buffered_frame_count(&self) -> usize {
-        self.frames.len()
+        if !self.indexed_frames.is_empty() {
+            // +1 for the initial RGBA frame stored in frames[0].
+            1 + self.indexed_frames.len()
+        } else {
+            self.frames.len()
+        }
     }
 
     /// Global index of the oldest frame in the buffer (the frame at local index 0).
@@ -292,7 +309,7 @@ impl VisualPreviewSession {
     /// instead of wrapping over the full total-decoded range, which would advance
     /// through evicted frames and appear as a freeze or fast-forward.
     pub(crate) fn window_start(&self) -> usize {
-        self.total_frames_decoded.saturating_sub(self.frames.len())
+        self.total_frames_decoded.saturating_sub(self.buffered_frame_count())
     }
 
     /// Number of display surfaces the runtime needs for this session.
@@ -306,13 +323,22 @@ impl VisualPreviewSession {
 
     /// Zero-based global index of the currently selected frame.
     pub(crate) fn current_frame_index(&self) -> usize {
-        let window_start = self.total_frames_decoded.saturating_sub(self.frames.len());
+        let window_start = self.total_frames_decoded.saturating_sub(self.buffered_frame_count());
         window_start + self.current_frame
     }
 
     /// Current RGBA frame that should be visible on screen.
+    ///
+    /// For the indexed-storage path (VQA streaming), `current_rgba` holds
+    /// the lazily-converted RGBA for any frame beyond the initial frame 0.
+    /// Frame 0 is always available as `frames[0]` from the first-frame path.
     pub(crate) fn current_frame(&self) -> &ic_render::sprite::RgbaSpriteFrame {
-        &self.frames[self.current_frame]
+        if !self.indexed_frames.is_empty() {
+            // local 0 → initial RGBA frame; local 1+ → cached conversion
+            self.current_rgba.as_ref().unwrap_or(&self.frames[0])
+        } else {
+            &self.frames[self.current_frame]
+        }
     }
 
     /// Shared frame cadence for animation playback, if this session is not
@@ -327,10 +353,28 @@ impl VisualPreviewSession {
     /// the requested frame has been evicted from the sliding window, the
     /// index is clamped to the nearest buffered frame.
     pub(crate) fn select_frame(&mut self, frame_index: usize) {
-        if self.frames.is_empty() {
+        if !self.indexed_frames.is_empty() {
+            // Indexed-storage path.
+            // Local index 0 = initial RGBA frame (frames[0]).
+            // Local index 1..N = indexed_frames[0..N-1].
+            let buffered = self.buffered_frame_count();
+            let window_start = self.total_frames_decoded.saturating_sub(buffered);
+            let local = if frame_index >= window_start {
+                (frame_index - window_start).min(buffered.saturating_sub(1))
+            } else {
+                0 // Evicted — clamp to oldest available.
+            };
+            self.current_frame = local;
+            // Refresh the RGBA cache for the new position.
+            self.current_rgba = if local == 0 {
+                None // frames[0] is the display frame
+            } else {
+                self.indexed_frames.get(local - 1).and_then(|f| f.to_rgba())
+            };
+        } else if self.frames.is_empty() {
             self.current_frame = 0;
         } else {
-            // Convert global index to buffer-local index.
+            // RGBA-storage path (non-VQA, or VQA before indexed frames arrive).
             let window_start = self.total_frames_decoded.saturating_sub(self.frames.len());
             if frame_index >= window_start {
                 self.current_frame = (frame_index - window_start) % self.frames.len();
@@ -369,6 +413,44 @@ impl VisualPreviewSession {
             if safe > 0 {
                 self.frames.drain(..safe);
                 self.current_frame -= safe;
+            }
+        }
+    }
+
+    /// Appends compact palette-indexed frames for the VQA streaming path.
+    ///
+    /// Mirrors `push_frames` but stores frames as `IndexedFrame` (1 byte/pixel)
+    /// rather than RGBA (4 bytes/pixel), yielding a ~4× memory reduction.
+    /// RGBA conversion happens lazily in `select_frame` for the one active
+    /// display frame only.
+    ///
+    /// Eviction is cursor-gated: only frames the playback cursor has already
+    /// passed (local index < `current_frame`) are candidates for eviction.
+    /// Frame 0 (the initial RGBA in `frames[0]`) is never evicted.
+    pub(crate) fn push_indexed_frames(&mut self, new_frames: Vec<super::vqa_stream::IndexedFrame>) {
+        self.total_frames_decoded += new_frames.len();
+        self.indexed_frames.extend(new_frames);
+
+        // Indexed frames occupy local indices 1..N; the max allowed is
+        // MAX_SESSION_FRAMES - 1 (reserving slot 0 for the initial RGBA).
+        let max_indexed = MAX_SESSION_FRAMES.saturating_sub(1);
+        if self.indexed_frames.len() > max_indexed {
+            let budget = self.indexed_frames.len() - max_indexed;
+            // current_frame local 0 = initial RGBA (not evictable).
+            // Local 1..N maps to indexed_frames[0..N-1], so the cursor
+            // within indexed_frames is current_frame.saturating_sub(1).
+            let cursor_in_indexed = self.current_frame.saturating_sub(1);
+            let safe = budget.min(cursor_in_indexed);
+            if safe > 0 {
+                self.indexed_frames.drain(..safe);
+                self.current_frame -= safe;
+                // Refresh the cache — indices shifted after eviction.
+                self.current_rgba = if self.current_frame == 0 {
+                    None
+                } else {
+                    self.indexed_frames.get(self.current_frame - 1)
+                        .and_then(|f| f.to_rgba())
+                };
             }
         }
     }
@@ -439,6 +521,16 @@ pub(crate) struct ContentPreviewTracker {
     /// True when the current entry is a `.vqa` file (used for scanlines gating).
     is_vqa: bool,
 
+    /// Audio samples accumulated across VQA streaming batches.  Collected
+    /// progressively during `StreamingFirstFrame` and consumed on transition
+    /// to `Ready`.  This avoids buffering the entire video just to extract
+    /// audio eagerly.
+    streaming_audio_samples: Vec<i16>,
+    /// Audio sample rate received with the first audio-carrying batch.
+    streaming_audio_sample_rate: Option<u32>,
+    /// Audio channel count received with the first audio-carrying batch.
+    streaming_audio_channels: Option<u16>,
+
     // --- Playlist loop detection ---
     /// Wall-clock seconds elapsed since the current entry started playing.
     /// Reset to 0 on every selection change.
@@ -471,6 +563,9 @@ impl ContentPreviewTracker {
         // scanlines_overlay_entity and _material are session-persistent —
         // the fullscreen overlay is reused across entries, not per-entry.
         self.selected_image_entity = None;
+        self.streaming_audio_samples.clear();
+        self.streaming_audio_sample_rate = None;
+        self.streaming_audio_channels = None;
         self.phase = PreviewPhase::Empty;
     }
 
@@ -479,6 +574,9 @@ impl ContentPreviewTracker {
         if let Some(handle) = self.display_image_handle.take() {
             images.remove(handle.id());
         }
+        self.streaming_audio_samples.clear();
+        self.streaming_audio_sample_rate = None;
+        self.streaming_audio_channels = None;
         // scanlines_overlay_entity and _material are session-persistent.
         self.selected_image_entity = None;
         self.phase = PreviewPhase::Empty;
@@ -496,9 +594,9 @@ impl ContentPreviewTracker {
         let family = self.phase_family()
             .expect("begin_streaming requires a phase with a known family");
         // Hold playback until `finalize_streaming` so that audio and video
-        // start together from frame 0.  Advancing the animation during decode
-        // would cause audible silence (audio only arrives with the final batch)
-        // and A/V desync (video ahead of audio when audio finally starts).
+        // start together from frame 0.  Audio arrives progressively across
+        // batches but is only committed to the sound engine on finalize,
+        // keeping A/V in sync.
         self.phase = PreviewPhase::StreamingFirstFrame {
             family,
             visual_session,
@@ -507,18 +605,17 @@ impl ContentPreviewTracker {
         };
     }
 
-    /// Append frames to the streaming session.
+    /// Append compact palette-indexed frames to the streaming session.
     ///
-    /// Only valid in `StreamingFirstFrame`.  The type system guarantees
-    /// that `push_frames` on `VisualPreviewSession` is unreachable from
-    /// `Ready` — only `finalize_streaming` can produce the transition.
+    /// Only valid in `StreamingFirstFrame`.  Frames are stored as indexed
+    /// PAL8 (1 byte/pixel) instead of RGBA, cutting per-frame memory ~4×.
     fn push_streaming_frames(
         &mut self,
-        frames: Vec<ic_render::sprite::RgbaSpriteFrame>,
+        frames: Vec<super::vqa_stream::IndexedFrame>,
     ) {
         match &mut self.phase {
             PreviewPhase::StreamingFirstFrame { visual_session, .. } => {
-                visual_session.push_frames(frames);
+                visual_session.push_indexed_frames(frames);
             }
             _ => {}
         }
@@ -1298,12 +1395,22 @@ pub(crate) fn poll_content_preview_load(
                     tracker.push_streaming_frames(batch.frames);
                 }
 
+                // Accumulate audio progressively across batches.
+                if !batch.audio_samples.is_empty() {
+                    if tracker.streaming_audio_sample_rate.is_none() {
+                        tracker.streaming_audio_sample_rate = batch.audio_sample_rate;
+                        tracker.streaming_audio_channels = batch.audio_channels;
+                    }
+                    tracker.streaming_audio_samples.extend_from_slice(&batch.audio_samples);
+                }
+
                 // When the final batch arrives, transition to Ready.
                 if batch.done {
-                    let total_samples = batch.audio_samples.len();
+                    let all_audio = std::mem::take(&mut tracker.streaming_audio_samples);
+                    let total_samples = all_audio.len();
                     let audio_info = if total_samples > 0 {
                         if let (Some(sample_rate), Some(channels)) =
-                            (batch.audio_sample_rate, batch.audio_channels)
+                            (tracker.streaming_audio_sample_rate.take(), tracker.streaming_audio_channels.take())
                         {
                             #[cfg(target_os = "windows")]
                             {
@@ -1318,7 +1425,7 @@ pub(crate) fn poll_content_preview_load(
                                 // audio and video have the same total period and
                                 // the same phase within that period.
                                 let samples = rotate_audio_to_video_position(
-                                    batch.audio_samples,
+                                    all_audio,
                                     sample_rate,
                                     channels,
                                     &tracker,
