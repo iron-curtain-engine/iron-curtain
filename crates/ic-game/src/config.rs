@@ -113,6 +113,11 @@ pub struct PlaybackConfig {
     pub movie_max_height: f32,
     /// Darken every other row to simulate CRT scanlines.
     pub scanlines: bool,
+    /// Apply Bayer 4×4 ordered dithering when expanding VQA palette-indexed
+    /// frames to RGBA.  Breaks up gradient banding from the original 6-bit
+    /// VGA palette (64 levels per channel → 8-bit).
+    /// Set to `false` to display raw palette colours without any dithering.
+    pub vqa_dither: bool,
 }
 
 impl Default for PlaybackConfig {
@@ -124,6 +129,7 @@ impl Default for PlaybackConfig {
             movie_max_width: 0.96,
             movie_max_height: 0.96,
             scanlines: true,
+            vqa_dither: true,
         }
     }
 }
@@ -269,6 +275,22 @@ mod tests {
         assert!((config.playback.default_animation_fps - 12.0).abs() < f32::EPSILON);
         assert!((config.playback.preview_max_width - 0.72).abs() < f32::EPSILON);
         assert!((config.playback.movie_max_width - 0.96).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vqa_dither_defaults_to_true() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert!(config.playback.vqa_dither, "vqa_dither should default to true");
+    }
+
+    #[test]
+    fn vqa_dither_can_be_disabled_via_toml() {
+        let toml = r#"
+            [playback]
+            vqa_dither = false
+        "#;
+        let config = GameConfig::from_toml(toml).unwrap();
+        assert!(!config.playback.vqa_dither, "vqa_dither should be false when set in TOML");
     }
 
     #[test]

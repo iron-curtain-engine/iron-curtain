@@ -84,13 +84,17 @@ pub(crate) struct IndexedFrame {
 
 impl IndexedFrame {
     /// Convert to RGBA on demand for GPU upload.
-    pub(crate) fn to_rgba(&self) -> Option<RgbaSpriteFrame> {
+    ///
+    /// `dither` enables Bayer 4×4 ordered dithering, which breaks up
+    /// gradient banding caused by the original 6-bit VGA palette.
+    pub(crate) fn to_rgba(&self, dither: bool) -> Option<RgbaSpriteFrame> {
         rgba_frame_from_palette_indices(
             self.width,
             self.height,
             &self.pixels,
             &self.palette,
             false,
+            dither,
         )
         .ok()
     }

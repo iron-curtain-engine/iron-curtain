@@ -69,15 +69,21 @@ default_animation_fps = 12.0
 
 # Maximum fraction of the window the preview surface can occupy.
 # Videos get larger fractions for a cinematic feel.
-preview_max_width  = 0.72
+preview_max_width = 0.72
 preview_max_height = 0.72
-movie_max_width    = 0.96
-movie_max_height   = 0.96
+movie_max_width = 0.96
+movie_max_height = 0.96
 
 # Darken every other row to simulate CRT scanlines.
 # Replicates the look of the original game on a 240p CRT monitor.
 # Set to false to display raw decoded pixels without the effect.
 scanlines = true
+
+# Apply Bayer 4×4 ordered dithering when expanding VQA movie frames from
+# palette-indexed (6-bit VGA) to RGBA.  Breaks up visible gradient banding
+# at colour transitions — the same technique used by ffplay and OpenRA.
+# Set to false to display the raw palette colours with no dithering.
+vqa_dither = false
 
 # ─── Audio ──────────────────────────────────────────────────────────────────
 

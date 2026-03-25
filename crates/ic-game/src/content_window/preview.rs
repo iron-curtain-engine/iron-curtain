@@ -254,6 +254,9 @@ pub(crate) struct VisualPreviewSession {
     /// to an indexed frame (local index ≥ 1).  `None` means the cursor is
     /// at local index 0 — the initial RGBA frame stored in `frames[0]`.
     current_rgba: Option<ic_render::sprite::RgbaSpriteFrame>,
+    /// Whether Bayer dithering is applied when converting indexed frames to
+    /// RGBA.  Mirrors `PlaybackConfig::vqa_dither`; set via `with_dither()`.
+    dither: bool,
 }
 
 /// Maximum number of decoded RGBA frames kept in the sliding window.
@@ -285,7 +288,17 @@ impl VisualPreviewSession {
             total_frames_decoded: total,
             indexed_frames: Vec::new(),
             current_rgba: None,
+            dither: true,
         })
+    }
+
+    /// Sets the Bayer dithering flag for indexed-frame RGBA conversion.
+    ///
+    /// Call this after `new()` to apply the value from `PlaybackConfig::vqa_dither`.
+    /// The default is `true` (dithering enabled).
+    pub(crate) fn with_dither(mut self, dither: bool) -> Self {
+        self.dither = dither;
+        self
     }
 
     /// Total number of frames decoded so far (including evicted ones).
@@ -369,7 +382,7 @@ impl VisualPreviewSession {
             self.current_rgba = if local == 0 {
                 None // frames[0] is the display frame
             } else {
-                self.indexed_frames.get(local - 1).and_then(|f| f.to_rgba())
+                self.indexed_frames.get(local - 1).and_then(|f| f.to_rgba(self.dither))
             };
         } else if self.frames.is_empty() {
             self.current_frame = 0;
@@ -449,7 +462,7 @@ impl VisualPreviewSession {
                     None
                 } else {
                     self.indexed_frames.get(self.current_frame - 1)
-                        .and_then(|f| f.to_rgba())
+                        .and_then(|f| f.to_rgba(self.dither))
                 };
             }
         }
@@ -1144,6 +1157,7 @@ pub(crate) fn refresh_content_preview(
     mut tracker: ResMut<ContentPreviewTracker>,
     archive_cache: Res<super::ArchivePreloadCache>,
     handle_cache: Res<super::ArchiveHandleCache>,
+    playback: Res<super::PlaybackSettings>,
     #[cfg(target_os = "windows")]
     existing_audio_entities: Query<(Entity, Option<&AudioSink>), With<ContentPreviewAudio>>,
     #[cfg(not(target_os = "windows"))]
@@ -1210,6 +1224,7 @@ pub(crate) fn refresh_content_preview(
             state.catalogs().to_vec(),
             archive_cache.clone(),
             handle_cache.clone(),
+            playback.0.vqa_dither,
         ));
         return;
     }
@@ -1268,6 +1283,7 @@ pub(crate) fn poll_content_preview_load(
     #[cfg(target_os = "windows")] mut audio_sources: ResMut<Assets<PcmAudioSource>>,
     mut state: ResMut<ContentLabState>,
     mut tracker: ResMut<ContentPreviewTracker>,
+    playback: Res<super::PlaybackSettings>,
 ) {
     let Some(task) = task else {
         return;
@@ -1312,7 +1328,7 @@ pub(crate) fn poll_content_preview_load(
                         if let Some(session) = VisualPreviewSession::new(
                             visual.frames().to_vec(),
                             visual.frame_duration_seconds(),
-                        ) {
+                        ).map(|s| s.with_dither(playback.0.vqa_dither)) {
                             let initial_frame = session.current_frame();
                             tracker.display_image_handle =
                                 Some(images.add(rgba_frame_to_image(initial_frame)));
@@ -2060,6 +2076,7 @@ fn start_content_preview_load(
     catalogs: Vec<ContentCatalog>,
     archive_cache: super::ArchivePreloadCache,
     handle_cache: super::ArchiveHandleCache,
+    dither: bool,
 ) -> ContentPreviewLoadTask {
     let (sender, receiver) = mpsc::channel();
     let is_video = should_background_load_preview(&entry);
@@ -2095,7 +2112,7 @@ fn start_content_preview_load(
                 match super::vqa_stream::decode_vqa_first_frame(&bytes) {
                     Ok(Some(first)) => {
                         if let Ok(first_preview) =
-                            build_first_frame_preview(&entry, first)
+                            build_first_frame_preview(&entry, first, dither)
                         {
                             let t_first = t1.elapsed();
                             eprintln!(

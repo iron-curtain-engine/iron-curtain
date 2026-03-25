@@ -2394,3 +2394,81 @@ fn loop_duration_uses_buffered_frame_count_not_total_decoded() {
          less than total ({total_duration:.2}s) after partial eviction",
     );
 }
+
+// ─── Dithering tests ─────────────────────────────────────────────────────────
+
+/// Proves that `IndexedFrame::to_rgba(dither: false)` returns the raw palette
+/// colour, and `to_rgba(dither: true)` returns a potentially different value
+/// due to the Bayer bias being applied.
+///
+/// The test frame is a single pixel at palette index 128, mapped to a mid-grey
+/// palette entry (128, 128, 128).  With 6-bit upscaling the stored value is
+/// `(128 >> 2) << 2 = 128` after the << 2 / scaling, but the Bayer table at
+/// position (0, 0) has value 0 giving a bias of `0 - 7 = -7`, which pushes
+/// the resulting channel below 128.
+#[test]
+fn indexed_frame_to_rgba_dither_flag_affects_output() {
+    use super::vqa_stream::IndexedFrame;
+
+    // Build a 1×1 palette: index 0 = pure mid-grey (128, 128, 128).
+    // Palette entries are 8-bit values used directly (no scaling).
+    let mut palette = [0u8; 768];
+    palette[0] = 128; // R
+    palette[1] = 128; // G
+    palette[2] = 128; // B
+
+    let frame = IndexedFrame {
+        width: 1,
+        height: 1,
+        pixels: vec![0],
+        palette,
+    };
+
+    let raw = frame.to_rgba(false).expect("to_rgba(false) should succeed");
+    let dithered = frame.to_rgba(true).expect("to_rgba(true) should succeed");
+
+    // Both must produce a valid 1×1 RGBA frame.
+    assert_eq!(raw.width(), 1);
+    assert_eq!(raw.height(), 1);
+    assert_eq!(dithered.width(), 1);
+    assert_eq!(dithered.height(), 1);
+
+    // The dithered output should differ from the raw output at pixel (0,0)
+    // because the Bayer matrix at (0,0) applies a non-zero bias.
+    let raw_rgba = raw.rgba8_pixels();
+    let dithered_rgba = dithered.rgba8_pixels();
+    assert_ne!(
+        raw_rgba, dithered_rgba,
+        "dithered pixel must differ from raw pixel for mid-grey at Bayer (0,0)"
+    );
+    // Alpha must always be 255 for opaque VQA frames.
+    assert_eq!(raw_rgba.get(3).copied(), Some(255u8));
+    assert_eq!(dithered_rgba.get(3).copied(), Some(255u8));
+}
+
+/// Proves that `IndexedFrame::to_rgba(false)` applied twice yields identical
+/// output — raw conversion is deterministic.
+#[test]
+fn indexed_frame_to_rgba_no_dither_is_deterministic() {
+    use super::vqa_stream::IndexedFrame;
+
+    let mut palette = [0u8; 768];
+    palette[0] = 20;
+    palette[1] = 40;
+    palette[2] = 60;
+
+    let frame = IndexedFrame {
+        width: 2,
+        height: 2,
+        pixels: vec![0, 0, 0, 0],
+        palette,
+    };
+
+    let first = frame.to_rgba(false).expect("first conversion should succeed");
+    let second = frame.to_rgba(false).expect("second conversion should succeed");
+    assert_eq!(
+        first.rgba8_pixels(),
+        second.rgba8_pixels(),
+        "undithered conversion must be deterministic"
+    );
+}

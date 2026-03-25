@@ -1040,6 +1040,7 @@ fn load_vqa_preview(
                 // failure mode the user saw: mostly dark screen, sparse visible
                 // fragments, and correct audio.
                 false,
+                false,
             )
         })
         .collect::<Result<Vec<_>, SpriteBootstrapError>>()?;
@@ -1541,29 +1542,56 @@ fn draw_waveform_column(
     }
 }
 
+/// Bayer 4×4 ordered dither matrix (values 0–15, canonical arrangement).
+///
+/// At each pixel position (x, y) the offset `BAYER_4X4[y % 4][x % 4]`
+/// is subtracted from 7 to center the range, giving a bias in `[-7, +8]`.
+/// Scaled to the 6-bit VGA step size (4 counts), this breaks visible
+/// banding in palette gradients — the same technique used by ffplay and
+/// OpenRA's software renderer.
+const BAYER_4X4: [[i16; 4]; 4] = [
+    [ 0,  8,  2, 10],
+    [12,  4, 14,  6],
+    [ 3, 11,  1,  9],
+    [15,  7, 13,  5],
+];
+
 pub(crate) fn rgba_frame_from_palette_indices(
     width: u32,
     height: u32,
     pixels: &[u8],
     palette_rgb8: &[u8; 768],
     transparent_zero: bool,
+    dither: bool,
 ) -> Result<RgbaSpriteFrame, SpriteBootstrapError> {
     let mut rgba = Vec::with_capacity(
         (width as usize)
             .saturating_mul(height as usize)
             .saturating_mul(4),
     );
+    let mut x = 0u32;
+    let mut y = 0u32;
     for &index in pixels {
         let base = (index as usize).saturating_mul(3);
         let r = palette_rgb8.get(base).copied().unwrap_or(0);
         let g = palette_rgb8.get(base + 1).copied().unwrap_or(0);
         let b = palette_rgb8.get(base + 2).copied().unwrap_or(0);
-        let alpha = if transparent_zero && index == 0 {
-            0
+        let alpha = if transparent_zero && index == 0 { 0 } else { 255 };
+
+        let (r, g, b) = if dither {
+            let bias = BAYER_4X4[(y % 4) as usize][(x % 4) as usize] - 7;
+            (
+                (r as i16 + bias).clamp(0, 255) as u8,
+                (g as i16 + bias).clamp(0, 255) as u8,
+                (b as i16 + bias).clamp(0, 255) as u8,
+            )
         } else {
-            255
+            (r, g, b)
         };
+
         rgba.extend_from_slice(&[r, g, b, alpha]);
+        x += 1;
+        if x >= width { x = 0; y += 1; }
     }
     RgbaSpriteFrame::from_rgba(width, height, rgba)
 }
@@ -1591,7 +1619,7 @@ pub(crate) fn load_vqa_first_frame_preview(
         Some(f) => f,
         None => return Ok(None),
     };
-    Ok(Some(build_first_frame_preview(entry, first)?))
+    Ok(Some(build_first_frame_preview(entry, first, true)?))
 }
 
 /// Builds a first-frame preview from an already-decoded first frame.
@@ -1601,6 +1629,7 @@ pub(crate) fn load_vqa_first_frame_preview(
 pub(crate) fn build_first_frame_preview(
     entry: &ContentCatalogEntry,
     first: super::vqa_stream::FirstVqaFrame,
+    dither: bool,
 ) -> Result<PreparedContentPreview, PreviewLoadError> {
     let rgba = rgba_frame_from_palette_indices(
         first.width as u32,
@@ -1608,6 +1637,7 @@ pub(crate) fn build_first_frame_preview(
         &first.frame.pixels,
         &first.frame.palette,
         false,
+        dither,
     )?;
 
     let fps = first.fps;
