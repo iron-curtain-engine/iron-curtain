@@ -118,6 +118,16 @@ pub struct PlaybackConfig {
     /// VGA palette (64 levels per channel → 8-bit).
     /// Set to `false` to display raw palette colours without any dithering.
     pub vqa_dither: bool,
+    /// Apply TPDF (triangular probability density function) 1-LSB dither to
+    /// decoded VQA audio samples.  IMA ADPCM's 4-bit quantisation introduces
+    /// correlated error harmonics; dither whitens the noise floor.
+    /// Set to `false` to pass raw decoded PCM to the audio device.
+    pub audio_dither: bool,
+    /// Apply a single-pole IIR high-pass filter to decoded VQA audio to
+    /// suppress DC offset.  SND1 (Westwood ADPCM) initialises its predictor
+    /// to mid-scale (0x80), which causes a DC step at stream start.
+    /// Set to `false` to skip DC correction.
+    pub audio_dc_correction: bool,
 }
 
 impl Default for PlaybackConfig {
@@ -130,6 +140,8 @@ impl Default for PlaybackConfig {
             movie_max_height: 0.96,
             scanlines: true,
             vqa_dither: true,
+            audio_dither: true,
+            audio_dc_correction: true,
         }
     }
 }
@@ -304,5 +316,49 @@ mod tests {
         let config = GameConfig::from_toml(toml).unwrap();
         assert_eq!(config.display.mode, "windowed");
         assert_eq!(config.display.width, 1920);
+    }
+
+    #[test]
+    fn audio_dither_defaults_to_true() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert!(
+            config.playback.audio_dither,
+            "audio_dither should default to true"
+        );
+    }
+
+    #[test]
+    fn audio_dither_can_be_disabled_via_toml() {
+        let toml = r#"
+            [playback]
+            audio_dither = false
+        "#;
+        let config = GameConfig::from_toml(toml).unwrap();
+        assert!(
+            !config.playback.audio_dither,
+            "audio_dither should be false when set in TOML"
+        );
+    }
+
+    #[test]
+    fn audio_dc_correction_defaults_to_true() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert!(
+            config.playback.audio_dc_correction,
+            "audio_dc_correction should default to true"
+        );
+    }
+
+    #[test]
+    fn audio_dc_correction_can_be_disabled_via_toml() {
+        let toml = r#"
+            [playback]
+            audio_dc_correction = false
+        "#;
+        let config = GameConfig::from_toml(toml).unwrap();
+        assert!(
+            !config.playback.audio_dc_correction,
+            "audio_dc_correction should be false when set in TOML"
+        );
     }
 }

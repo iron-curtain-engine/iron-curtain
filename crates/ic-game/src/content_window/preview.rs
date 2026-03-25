@@ -1225,6 +1225,10 @@ pub(crate) fn refresh_content_preview(
             archive_cache.clone(),
             handle_cache.clone(),
             playback.0.vqa_dither,
+            super::vqa_stream::AudioPostProcess {
+                dither: playback.0.audio_dither,
+                dc_correction: playback.0.audio_dc_correction,
+            },
         ));
         return;
     }
@@ -2077,6 +2081,7 @@ fn start_content_preview_load(
     archive_cache: super::ArchivePreloadCache,
     handle_cache: super::ArchiveHandleCache,
     dither: bool,
+    audio_post: super::vqa_stream::AudioPostProcess,
 ) -> ContentPreviewLoadTask {
     let (sender, receiver) = mpsc::channel();
     let is_video = should_background_load_preview(&entry);
@@ -2159,7 +2164,7 @@ fn start_content_preview_load(
                         .name("ic-vqa-stream-decode".into())
                         .spawn(move || {
                             let _ = super::vqa_stream::stream_vqa_decode(
-                                bytes_clone, batch_tx,
+                                bytes_clone, batch_tx, audio_post,
                             );
                         })
                         .expect("VQA stream decode thread should start")

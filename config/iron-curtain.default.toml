@@ -83,7 +83,19 @@ scanlines = true
 # palette-indexed (6-bit VGA) to RGBA.  Breaks up visible gradient banding
 # at colour transitions — the same technique used by ffplay and OpenRA.
 # Set to false to display the raw palette colours with no dithering.
-vqa_dither = false
+vqa_dither = true
+
+# Apply TPDF (triangular probability density function) 1-LSB dither to
+# decoded VQA audio.  IMA ADPCM's 4-bit quantisation produces correlated
+# noise harmonics; dither whitens the noise floor, removing the faint
+# periodic buzz that is audible on headphones.  Magnitude is ±1 LSB —
+# inaudible in practice.  Set to false for raw undithered PCM.
+audio_dither = true
+
+# Apply a single-pole IIR high-pass filter to decoded VQA audio.  SND1
+# audio can carry a low-frequency DC offset; the filter removes it within
+# about 1000 samples.  Set to false to skip DC correction.
+audio_dc_correction = true
 
 # ─── Audio ──────────────────────────────────────────────────────────────────
 
