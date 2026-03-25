@@ -282,9 +282,17 @@ impl VisualPreviewSession {
     }
 
     /// Number of frames currently held in the sliding window buffer.
-    #[allow(dead_code, reason = "useful for diagnostics and future memory reporting")]
     pub(crate) fn buffered_frame_count(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Global index of the oldest frame in the buffer (the frame at local index 0).
+    ///
+    /// Used by the animation system to wrap playback within the available window
+    /// instead of wrapping over the full total-decoded range, which would advance
+    /// through evicted frames and appear as a freeze or fast-forward.
+    pub(crate) fn window_start(&self) -> usize {
+        self.total_frames_decoded.saturating_sub(self.frames.len())
     }
 
     /// Number of display surfaces the runtime needs for this session.
@@ -336,22 +344,31 @@ impl VisualPreviewSession {
     /// Appends additional frames to the session (for incremental streaming).
     ///
     /// Old frames beyond [`MAX_SESSION_FRAMES`] are evicted from the front
-    /// of the buffer to cap memory usage, but only frames that have already
-    /// been played (behind the current playback position). This prevents the
-    /// sliding window from evicting frames the viewer hasn't seen yet, which
-    /// would cause the video to jump ahead ("start from the middle").
+    /// of the buffer to cap memory usage, but **only frames that have already
+    /// been played** (behind the current buffer-local cursor).  This prevents
+    /// the sliding window from discarding frames the viewer hasn't seen yet,
+    /// which would cause the video to "start from the middle" on fast machines
+    /// where the decode thread outpaces the animation timer.
+    ///
+    /// If the cursor is at frame 0 (decode arrived before any animation tick),
+    /// no eviction happens and the buffer grows beyond `MAX_SESSION_FRAMES`.
+    /// The buffer is bounded by the total number of decoded frames, which for
+    /// typical RA1 cutscenes is well within acceptable memory limits.
     pub(crate) fn push_frames(&mut self, new_frames: Vec<ic_render::sprite::RgbaSpriteFrame>) {
         self.total_frames_decoded += new_frames.len();
         self.frames.extend(new_frames);
 
-        // Only evict frames behind the current playback position.
+        // Only evict frames the animation has already played past (behind the
+        // buffer-local cursor).  Unconditional eviction moved the effective
+        // start position to window_start when current_frame=0, causing the
+        // viewer to "start from the middle" for long VQAs decoded faster than
+        // playback.
         if self.frames.len() > MAX_SESSION_FRAMES {
-            let evict_budget = self.frames.len() - MAX_SESSION_FRAMES;
-            // Never evict past the current frame — only reclaim already-played frames.
-            let safe_evict = evict_budget.min(self.current_frame);
-            if safe_evict > 0 {
-                self.frames.drain(..safe_evict);
-                self.current_frame -= safe_evict;
+            let budget = self.frames.len() - MAX_SESSION_FRAMES;
+            let safe = budget.min(self.current_frame);
+            if safe > 0 {
+                self.frames.drain(..safe);
+                self.current_frame -= safe;
             }
         }
     }
@@ -478,11 +495,15 @@ impl ContentPreviewTracker {
     fn begin_streaming(&mut self, visual_session: VisualPreviewSession) {
         let family = self.phase_family()
             .expect("begin_streaming requires a phase with a known family");
+        // Hold playback until `finalize_streaming` so that audio and video
+        // start together from frame 0.  Advancing the animation during decode
+        // would cause audible silence (audio only arrives with the final batch)
+        // and A/V desync (video ahead of audio when audio finally starts).
         self.phase = PreviewPhase::StreamingFirstFrame {
             family,
             visual_session,
             frame_timer_seconds: 0.0,
-            playback_requested: true,
+            playback_requested: false,
         };
     }
 
@@ -505,11 +526,11 @@ impl ContentPreviewTracker {
 
     /// Transition: StreamingFirstFrame → Ready.
     ///
-    /// Preserves the current frame position, timer, and Timer sync mode so
-    /// playback continues without a visible skip.  The caller is responsible
-    /// for aligning the audio start position with the video's current frame
-    /// before spawning the audio entity (see `rotate_audio_to_video_position`
-    /// in `poll_content_preview_load`).
+    /// Resets the frame timer to zero and starts playback.  Because
+    /// `begin_streaming` holds `playback_requested = false`, the animation
+    /// has been paused at frame 0 throughout the decode.  Transitioning here
+    /// starts both video (from frame 0) and audio (just spawned by the caller)
+    /// simultaneously, giving clean A/V sync with no leading silence.
     fn finalize_streaming(
         &mut self,
         audio_info: Option<AudioInfo>,
@@ -519,15 +540,22 @@ impl ContentPreviewTracker {
             PreviewPhase::StreamingFirstFrame {
                 family,
                 visual_session,
-                frame_timer_seconds,
-                playback_requested,
+                ..
             } => {
                 self.phase = PreviewPhase::Ready {
                     family,
                     visual_session,
-                    frame_timer_seconds,
-                    playback_requested,
-                    sync_mode: PlaybackSyncMode::Timer,
+                    frame_timer_seconds: 0.0,
+                    playback_requested: true,
+                    // Use AudioSync when audio is present so video frame
+                    // advancement is driven by the audio clock rather than
+                    // Bevy's frame timer.  Timer mode causes visible A/V drift
+                    // because the two clocks run independently.
+                    sync_mode: if audio_info.is_some() {
+                        PlaybackSyncMode::AudioSync
+                    } else {
+                        PlaybackSyncMode::Timer
+                    },
                     audio_info,
                     text_available: false,
                 };
@@ -706,6 +734,15 @@ impl ContentPreviewTracker {
             .map_or(0, VisualPreviewSession::current_frame_index)
     }
 
+    /// Global index of the oldest buffered frame.
+    ///
+    /// In the Ready phase, the animation must wrap within `window_start..window_start+buffered`
+    /// instead of `0..total_decoded`, to avoid advancing through evicted frames.
+    pub(crate) fn visual_session_window_start(&self) -> usize {
+        self.visual_session()
+            .map_or(0, VisualPreviewSession::window_start)
+    }
+
     pub(crate) fn current_image_handle(&self) -> Option<Handle<Image>> {
         self.display_image_handle.clone()
     }
@@ -747,7 +784,15 @@ impl ContentPreviewTracker {
     /// visual content, audio duration for audio-only content.
     pub(crate) fn loop_duration_seconds(&self) -> Option<f32> {
         if let Some(fd) = self.frame_duration_seconds() {
-            let fc = self.frame_count();
+            // Use the number of buffered frames, not total_decoded.
+            //
+            // After eviction, total_decoded may be far larger than what's actually
+            // in the sliding window buffer.  Using total_decoded would make the loop
+            // timer wait for the full video duration (e.g. 30 s) while the animation
+            // visually cycles every 8 s (120 buffered frames at 15 fps).  Using
+            // buffered_frame_count ensures the loop duration matches what the user
+            // actually sees — no premature auto-advance, no stuck-frame epochs.
+            let fc = self.buffered_frame_count();
             if fc > 0 {
                 return Some(fd * fc as f32);
             }
@@ -1485,6 +1530,11 @@ pub(crate) fn advance_content_preview_animation(
     let frame_count = tracker.frame_count();
     let current = tracker.current_frame_index();
     let streaming = tracker.is_streaming();
+    // Oldest globally-accessible frame (window_start = total_decoded - buffered).
+    // In Ready mode the animation wraps within window_start..window_start+buffered
+    // so it never advances through evicted frames (which would cause a freeze).
+    let window_start = tracker.visual_session_window_start();
+    let buffered = tracker.buffered_frame_count();
 
     // When audio-syncing, derive the frame index from the audio sink's
     // playback position.  We look up the sink by tracker.audio_entity rather
@@ -1495,16 +1545,26 @@ pub(crate) fn advance_content_preview_animation(
         tracker.audio_entity
             .and_then(|entity| audio_sink_query.get(entity).ok())
             .map(|sink| {
-                let fc = frame_count.max(1);
+                let fc = buffered.max(1);
                 let cycle_seconds = frame_duration * fc as f32;
                 let position = sink.position().as_secs_f32();
-                ((position % cycle_seconds) / frame_duration).floor() as usize % fc
+                // Map audio position to a global frame index within the buffer.
+                window_start + ((position % cycle_seconds) / frame_duration).floor() as usize % fc
             })
     } else {
         let Some(timer) = tracker.frame_timer_seconds_mut() else {
             return;
         };
-        *timer += time.delta_secs();
+        // Cap the delta to one frame when streaming so that a long "drain"
+        // Bevy frame (caused by decoding a full batch of VQA frames in one
+        // tick) does not cause the animation to skip multiple frames on the
+        // very next tick when time.delta_secs() reflects the full wall time.
+        let delta = if streaming {
+            time.delta_secs().min(frame_duration)
+        } else {
+            time.delta_secs()
+        };
+        *timer += delta;
         let mut advanced = current;
         while *timer >= frame_duration {
             *timer -= frame_duration;
@@ -1522,7 +1582,14 @@ pub(crate) fn advance_content_preview_animation(
                     break;
                 }
             } else {
-                advanced = (advanced + 1) % frame_count;
+                // Ready mode: wrap within the sliding-window buffer, not over
+                // the full total_decoded range.  Using total_decoded would
+                // advance through evicted frames — each mapped by select_frame
+                // to window_start — causing a multi-second freeze on every loop.
+                if buffered > 0 {
+                    let local = advanced.saturating_sub(window_start);
+                    advanced = window_start + (local + 1) % buffered;
+                }
             }
         }
         Some(advanced)
@@ -1564,12 +1631,23 @@ pub(crate) fn advance_content_preview_animation(
 
     let frame_count = tracker.frame_count();
     let current = tracker.current_frame_index();
+    let window_start = tracker.visual_session_window_start();
+    let buffered = tracker.buffered_frame_count();
 
     let streaming = tracker.is_streaming();
     let Some(timer) = tracker.frame_timer_seconds_mut() else {
         return;
     };
-    *timer += time.delta_secs();
+    // Cap the delta to one frame when streaming so that a long "drain"
+    // Bevy frame (caused by decoding a full batch of VQA frames in one
+    // tick) does not cause the animation to skip multiple frames on the
+    // very next tick when time.delta_secs() reflects the full wall time.
+    let delta = if streaming {
+        time.delta_secs().min(frame_duration)
+    } else {
+        time.delta_secs()
+    };
+    *timer += delta;
     let mut advanced = current;
     while *timer >= frame_duration {
         *timer -= frame_duration;
@@ -1582,7 +1660,12 @@ pub(crate) fn advance_content_preview_animation(
                 break;
             }
         } else {
-            advanced = (advanced + 1) % frame_count;
+            // Wrap within the buffer window to avoid advancing through
+            // evicted frames (see the Windows path for the detailed comment).
+            if buffered > 0 {
+                let local = advanced.saturating_sub(window_start);
+                advanced = window_start + (local + 1) % buffered;
+            }
         }
     }
 

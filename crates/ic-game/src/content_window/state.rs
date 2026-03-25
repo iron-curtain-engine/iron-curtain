@@ -228,6 +228,7 @@ impl ContentLabState {
         let next = (self.selected_catalog as isize + delta).rem_euclid(len) as usize;
         self.selected_catalog = next;
         self.selected_entry = self.first_gallery_entry_index(next).unwrap_or(0);
+        self.autoplay_position = None;
         self.dirty = true;
     }
 
@@ -249,6 +250,9 @@ impl ContentLabState {
         let len = gallery_indices.len() as isize;
         let next_gallery_position = (current_gallery_position + delta).rem_euclid(len) as usize;
         self.selected_entry = gallery_indices[next_gallery_position];
+        // Manual navigation exits playlist autoplay so the auto-advance
+        // does not hijack the selection when the current video finishes.
+        self.autoplay_position = None;
         self.dirty = true;
     }
 
@@ -261,6 +265,7 @@ impl ContentLabState {
     pub fn move_selection_to_start(&mut self) {
         if let Some(first_index) = self.first_gallery_entry_index(self.selected_catalog) {
             self.selected_entry = first_index;
+            self.autoplay_position = None;
             self.dirty = true;
         }
     }
@@ -272,6 +277,7 @@ impl ContentLabState {
             .and_then(|indices| indices.last().copied())
         {
             self.selected_entry = last_index;
+            self.autoplay_position = None;
             self.dirty = true;
         }
     }

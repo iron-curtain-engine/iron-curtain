@@ -31,6 +31,8 @@ pub struct ShpFrame {
     pub frame_index: usize,
     /// Compression/layout format used by the encoded frame payload.
     pub format: cnc_shp::ShpFrameFormat,
+    /// Absolute byte offset of this frame's data within the source file.
+    pub file_offset: u32,
     /// Reference offset for delta/composite frame variants.
     pub ref_offset: u16,
     /// Reference format tag used by the source file.
@@ -87,6 +89,7 @@ impl ShpSprite {
             .map(|(frame_index, frame)| ShpFrame {
                 frame_index,
                 format: frame.format,
+                file_offset: frame.file_offset,
                 ref_offset: frame.ref_offset,
                 ref_format: frame.ref_format,
                 encoded_len: frame.data.len(),

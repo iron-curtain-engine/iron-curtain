@@ -636,11 +636,9 @@ fn read_nested_via_seek<R: std::io::Read + std::io::Seek>(
         // Parse the intermediate header directly from the bounded reader
         // and read only the leaf entry bytes.
         let mut inner = MixArchiveReader::open(&mut entry_reader)?;
-        return inner
-            .read_by_index(leaf_index)?
-            .ok_or_else(|| PreviewLoadError::EmptyVisual {
-                entry_path: entry_path.to_string(),
-            });
+        return inner.read_by_index(leaf_index)?.ok_or_else(|| PreviewLoadError::EmptyVisual {
+            entry_path: entry_path.to_string(),
+        });
     }
 
     // Rare case: deeper nesting (3+ levels). We must materialise each
@@ -683,16 +681,66 @@ fn read_nested_via_seek<R: std::io::Read + std::io::Seek>(
         })
 }
 
+/// Parses an SHP file, retrying when the sentinel entry's `format_byte` is
+/// non-zero.
+///
+/// `cnc-formats` >= 0.1.0-alpha.4 already accepts non-zero `ref_offset` /
+/// `ref_format` in the EOF sentinel (our upstream fix).  A smaller set of
+/// RA1 files (e.g. MOUSE.SHP, EDMOUSE.SHP) additionally have a non-zero
+/// `format_byte` in that entry.  `format_byte` carries no meaning for the
+/// sentinel — only `file_offset` is used — so we zero the field and retry.
+fn parse_shp_lenient(bytes: Vec<u8>) -> Result<ShpSprite, cnc_formats::Error> {
+    match ShpSprite::parse(bytes.clone()) {
+        Ok(shp) => return Ok(shp),
+        Err(cnc_formats::Error::InvalidMagic { context: "SHP EOF sentinel" }) => {}
+        Err(e) => return Err(e),
+    }
+    // SHP header: frame_count at bytes 0..2 (LE u16); header = 14 bytes.
+    // Offset-table entries are 8 bytes: [u32 (fmt_byte<<24 | file_offset), u16, u16].
+    // Byte 3 of each entry (0-indexed within the entry) is the high byte of
+    // the u32 in little-endian, i.e. the format_byte field.
+    let mut patched = bytes;
+    let frame_count = match patched.get(0..2) {
+        Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
+        None => return ShpSprite::parse(patched),
+    };
+    let sentinel_start = 14 + frame_count * 8;
+    if sentinel_start + 4 <= patched.len() {
+        patched[sentinel_start + 3] = 0; // zero the format_byte
+    }
+    ShpSprite::parse(patched)
+}
+
 fn load_shp_preview(
     entry: &ContentCatalogEntry,
     catalogs: &[ContentCatalog],
 ) -> Result<PreparedContentPreview, PreviewLoadError> {
     let bytes = load_entry_bytes(entry)?;
-    let shp = ShpSprite::parse(bytes)?;
+    // Try TD/RA1 keyframe format first; fall back to Dune II format.
+    match parse_shp_lenient(bytes.clone()) {
+        Ok(shp) => load_shp_td_preview_from_parsed(shp, entry, catalogs),
+        Err(td_err) => load_shp_d2_preview_from_bytes(&bytes, entry, catalogs)
+            .map_err(|_| PreviewLoadError::from(td_err)),
+    }
+}
+
+fn load_shp_td_preview_from_parsed(
+    shp: ShpSprite,
+    entry: &ContentCatalogEntry,
+    catalogs: &[ContentCatalog],
+) -> Result<PreparedContentPreview, PreviewLoadError> {
     let (palette, palette_label) =
         palette_for_indexed_visual(entry, catalogs, shp.embedded_palette.clone())?;
     let render_palette = PaletteTextureSource::from_handoff(palette.render_handoff());
     let sheet_handoff = shp.render_handoff();
+
+    // Degenerate SHP files (e.g. SIDEBAR.SHP from HIRES.MIX) have width=0
+    // height=0 — there are no pixels to display.
+    if sheet_handoff.width == 0 || sheet_handoff.height == 0 {
+        return Err(PreviewLoadError::EmptyVisual {
+            entry_path: entry.relative_path.clone(),
+        });
+    }
 
     let decoded_frames = shp.decode_frames()?;
     if decoded_frames.is_empty() {
@@ -732,6 +780,63 @@ fn load_shp_preview(
         visual: Some(VisualPreview {
             frames,
             frame_duration_seconds: (sheet_handoff.frame_count > 1)
+                .then_some(1.0 / DEFAULT_ANIMATION_FPS),
+        }),
+        audio: None,
+        text_body: None,
+    })
+}
+
+/// Fallback SHP loader for Dune II–format sprite files.
+///
+/// Unlike the TD/RA1 format, SHP D2 files have a 2-byte header followed by a
+/// u32 offset table and per-frame headers that carry per-frame dimensions.
+/// Some RA1 game files (e.g. cursor sprites in LORES.MIX and EDITOR.MIX) are
+/// stored in this format despite being distributed with other RA1 content.
+fn load_shp_d2_preview_from_bytes(
+    bytes: &[u8],
+    entry: &ContentCatalogEntry,
+    catalogs: &[ContentCatalog],
+) -> Result<PreparedContentPreview, PreviewLoadError> {
+    let d2 = cnc_formats::shp_d2::ShpD2File::parse(bytes)?;
+    if d2.frame_count() == 0 {
+        return Err(PreviewLoadError::EmptyVisual {
+            entry_path: entry.relative_path.clone(),
+        });
+    }
+
+    // D2 SHPs have no embedded palette — always resolve from the catalog.
+    let (palette, palette_label) = palette_for_indexed_visual(entry, catalogs, None)?;
+    let render_palette = PaletteTextureSource::from_handoff(palette.render_handoff());
+
+    let first = d2.frame(0).expect("frame_count > 0");
+    let (w0, h0) = (first.width, first.height);
+
+    let frames = d2
+        .frames()
+        .iter()
+        .map(|f| {
+            // Each D2 frame carries its own dimensions; the display surface
+            // resizes automatically (see update_image_from_rgba_frame).
+            let indexed = IndexedSpriteFrame::new(
+                f.width as u32,
+                f.height as u32,
+                f.pixels.clone(),
+            )?;
+            Ok(indexed.to_rgba(&render_palette))
+        })
+        .collect::<Result<Vec<_>, SpriteBootstrapError>>()?;
+
+    Ok(PreparedContentPreview {
+        label: format!("Actual SHP preview: {}", entry.relative_path),
+        details: vec![
+            format!("frames: {} at {}x{} pixels (D2)", d2.frame_count(), w0, h0),
+            format!("palette: {palette_label}"),
+            preview_control_hint(true, false),
+        ],
+        visual: Some(VisualPreview {
+            frames,
+            frame_duration_seconds: (d2.frame_count() > 1)
                 .then_some(1.0 / DEFAULT_ANIMATION_FPS),
         }),
         audio: None,

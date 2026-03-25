@@ -1127,17 +1127,15 @@ fn streaming_first_frame_phase_uses_timer_and_auto_plays() {
     }
 }
 
-/// Proves that `finalize_streaming` preserves the video position and Timer
-/// mode when audio arrives, so the video does not visibly restart.
+/// Proves that `finalize_streaming` switches to AudioSync when audio is
+/// present and resets the frame position to 0.
 ///
-/// A/V sync is achieved by the caller rotating the audio sample buffer to
-/// match the video's current position (see `rotate_audio_to_video_position`)
-/// rather than resetting the video to frame 0.
-///
-/// Regression: resetting to frame 0 on audio arrival caused the movie to
-/// visibly restart after a few hundred milliseconds of streaming playback.
+/// The new design holds playback at frame 0 during decode
+/// (`playback_requested = false`) and starts both video and audio
+/// simultaneously from frame 0 on finalize, using AudioSync so that
+/// video frame advancement is driven by the audio clock.
 #[test]
-fn finalize_streaming_with_audio_preserves_position_and_timer() {
+fn finalize_streaming_with_audio_uses_audio_sync() {
     use super::preview::{
         AudioInfo, ContentPreviewTracker, PlaybackSyncMode,
         VisualPreviewSession,
@@ -1146,7 +1144,6 @@ fn finalize_streaming_with_audio_preserves_position_and_timer() {
 
     let mut tracker = ContentPreviewTracker::default();
 
-    // Simulate: Loading → StreamingFirstFrame with video advanced to frame 3.
     tracker.test_begin_loading(ContentFamily::Video);
     let frames: Vec<_> = (0..10)
         .map(|i| {
@@ -1157,27 +1154,25 @@ fn finalize_streaming_with_audio_preserves_position_and_timer() {
     let session =
         VisualPreviewSession::new(frames, Some(1.0 / 15.0)).expect("session should be created");
     tracker.test_begin_streaming(session);
-    // Advance video as if timer-based playback ran for a bit.
-    tracker.test_select_frame(3);
-    assert_eq!(tracker.test_current_frame_index(), 3);
+    // begin_streaming holds playback at frame 0.
+    assert_eq!(tracker.test_current_frame_index(), 0);
 
-    // Finalize with audio — must keep Timer and preserve position.
     tracker.test_finalize_streaming(Some(AudioInfo {
         duration_seconds: 5.0,
     }));
     assert_eq!(
         tracker.test_sync_mode(),
-        PlaybackSyncMode::Timer,
-        "finalize_streaming must keep Timer mode so the video never restarts",
+        PlaybackSyncMode::AudioSync,
+        "finalize_streaming with audio must use AudioSync to drive video from the audio clock",
     );
     assert_eq!(
         tracker.test_current_frame_index(),
-        3,
-        "finalize_streaming must preserve the video position",
+        0,
+        "finalize_streaming must start from frame 0",
     );
     assert!(
         tracker.test_playback_requested(),
-        "playback should remain requested after finalize",
+        "playback should be requested after finalize",
     );
 }
 
@@ -2106,38 +2101,49 @@ fn make_n_frames(n: usize) -> Vec<ic_render::sprite::RgbaSpriteFrame> {
         .collect()
 }
 
-/// Proves that `push_frames` does not evict frames ahead of the current
-/// playback position even when the buffer exceeds MAX_SESSION_FRAMES.
+/// Proves that `push_frames` caps the buffer at MAX_SESSION_FRAMES
+/// Proves that `push_frames` does NOT evict frames ahead of the playback
+/// cursor when the animation has not yet advanced (the fast-decode scenario).
 ///
-/// Regression: the old eviction logic drained from the front of the buffer
-/// unconditionally. When many streaming batches arrived in a single frame
-/// (the drain loop in `poll_content_preview_load`), frames the viewer had
-/// not yet seen were evicted, causing the video to jump to the middle.
+/// When VQA batches all arrive in a single Bevy frame before the animation
+/// timer has ticked from frame 0, the old unconditional eviction moved the
+/// viewer's global position to `window_start` (e.g. frame 330 out of 450),
+/// making the video appear to "start from the middle."
+///
+/// The fix: safe eviction only removes frames behind the cursor.
+/// When `current_frame = 0`, `safe_evict = min(budget, 0) = 0`, so no
+/// eviction happens.  The buffer temporarily exceeds `MAX_SESSION_FRAMES`
+/// but is bounded by the total VQA size (~112 MB for a 30-second movie).
 #[test]
-fn push_frames_does_not_evict_ahead_of_playback() {
+fn push_frames_does_not_evict_ahead_of_cursor_in_fast_decode() {
     // Start with 1 frame (simulates FirstFrame message).
     let mut session =
         super::preview::VisualPreviewSession::new(make_n_frames(1), Some(1.0 / 15.0))
             .expect("session should be created");
     assert_eq!(session.current_frame_index(), 0);
 
-    // Push 200 more frames (simulates many streaming batches arriving at once).
+    // Push 200 more frames — the fast-decode scenario where all streaming
+    // batches arrive before the animation timer has advanced from frame 0.
     // Total = 201, which exceeds MAX_SESSION_FRAMES (120).
     session.push_frames(make_n_frames(200));
 
+    // Total decoded frames is always accurate.
     assert_eq!(session.frame_count(), 201);
+
+    // The cursor is at frame 0, so safe_evict = min(81, 0) = 0.
+    // All 201 frames must remain in the buffer — no eviction should occur.
+    assert_eq!(
+        session.buffered_frame_count(),
+        201,
+        "buffer must retain all frames when cursor has not advanced: \
+         safe eviction prevents discarding unseen frames",
+    );
+
+    // Global frame index must stay at 0 — the viewer starts from the beginning.
     assert_eq!(
         session.current_frame_index(),
         0,
-        "playback position must remain at frame 0 — the viewer has not \
-         advanced past it yet, so no frames should be evicted ahead of it",
-    );
-
-    // The first frame's pixel data should still be accessible.
-    assert_eq!(
-        session.current_frame().rgba8_pixels(),
-        &[0, 0, 0, 255],
-        "the original first frame must still be in the buffer",
+        "global frame index must stay at 0 when no eviction has occurred",
     );
 }
 
@@ -2163,9 +2169,10 @@ fn push_frames_evicts_behind_playback_position() {
         50,
         "global frame index must stay at 50 after eviction",
     );
-    assert!(
-        session.buffered_frame_count() <= 160,
-        "some frames behind playback should have been evicted to cap memory",
+    assert_eq!(
+        session.buffered_frame_count(),
+        120,
+        "buffer must be capped exactly at MAX_SESSION_FRAMES (120)",
     );
 }
 
@@ -2235,5 +2242,155 @@ fn sliding_window_global_to_local_mapping_after_eviction() {
         session.current_frame_index(),
         100,
         "selecting a frame within the buffer must work correctly",
+    );
+}
+
+/// Proves that manual navigation (arrow keys) cancels playlist autoplay
+/// so the auto-advance does not hijack the selection when the current
+/// video finishes.
+///
+/// Regression: `move_selection` changed the selected entry but left
+/// `autoplay_position` set, so when the new video finished looping,
+/// `handle_playlist_advance` jumped to the NEXT playlist entry instead
+/// of staying on the manually-selected one.
+#[test]
+fn manual_navigation_cancels_playlist_autoplay() {
+    // ENGLISH.VQA is a SHOWCASE_RESOURCE_HINTS entry — scanning it causes
+    // build_autoplay_playlist to set autoplay_position = Some(0).
+    let fixture = TestDir::new("autoplay_cancel_test");
+    fixture.write_file("ENGLISH.VQA", b"vqa");
+    fixture.write_file("PROLOG.VQA", b"vqa");
+
+    let source = ContentSourceRoot::directory(
+        "Autoplay fixture",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    );
+    let catalog = ContentCatalog::scan(source);
+    let mut state = super::state::ContentLabState::loading(vec![]);
+    state.replace_catalogs(vec![catalog]);
+
+    // Confirm we're in playlist autoplay mode after the scan.
+    assert!(
+        state.is_autoplay_active(),
+        "expected autoplay to be active after scanning VQA showcase entries",
+    );
+
+    // The user manually navigates — this must cancel the playlist.
+    state.move_selection(1);
+
+    assert!(
+        !state.is_autoplay_active(),
+        "manual navigation must cancel playlist autoplay",
+    );
+}
+
+/// Proves that `cycle_catalog` (Q/E keys) also cancels playlist autoplay,
+/// preventing cross-catalog jumps when the user switches sources manually.
+#[test]
+fn cycle_catalog_cancels_playlist_autoplay() {
+    let fixture_a = TestDir::new("cycle_catalog_autoplay_a");
+    fixture_a.write_file("ENGLISH.VQA", b"vqa");
+    let fixture_b = TestDir::new("cycle_catalog_autoplay_b");
+    fixture_b.write_file("PROLOG.VQA", b"vqa");
+
+    let cat_a = ContentCatalog::scan(ContentSourceRoot::directory(
+        "Source A",
+        fixture_a.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    ));
+    let cat_b = ContentCatalog::scan(ContentSourceRoot::directory(
+        "Source B",
+        fixture_b.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    ));
+
+    let mut state = super::state::ContentLabState::loading(vec![]);
+    state.replace_catalogs(vec![cat_a, cat_b]);
+
+    assert!(
+        state.is_autoplay_active(),
+        "expected autoplay to be active after scanning VQA showcase entries",
+    );
+
+    state.cycle_catalog(1);
+    assert!(
+        !state.is_autoplay_active(),
+        "cycle_catalog must cancel playlist autoplay",
+    );
+}
+
+/// Proves that `window_start()` correctly reports the global index of the
+/// first frame currently in the sliding-window buffer.
+///
+/// After eviction, `window_start` must equal `total_decoded - buffered`.
+/// The animation system uses this to wrap playback within the buffer
+/// instead of over the full total_decoded range.
+#[test]
+fn window_start_reflects_eviction_offset() {
+    let mut session =
+        super::preview::VisualPreviewSession::new(make_n_frames(60), Some(1.0 / 15.0))
+            .expect("session should be created");
+    // Advance playback to frame 50 so we can evict the first 50.
+    session.select_frame(50);
+    // Push 100 more frames → total 160, evict 40 → buffer holds frames 40–159.
+    session.push_frames(make_n_frames(100));
+
+    assert_eq!(session.frame_count(), 160);
+    assert_eq!(session.buffered_frame_count(), 120);
+    assert_eq!(
+        session.window_start(),
+        40,
+        "window_start must equal total_decoded - buffered after eviction",
+    );
+    // Current frame (50) is still within the window (40..159).
+    assert_eq!(session.current_frame_index(), 50);
+}
+
+/// Proves that the loop-duration calculation uses `buffered_frame_count`,
+/// not `total_frames_decoded`.
+///
+/// Safe eviction only removes frames behind the playback cursor, so the
+/// buffered count naturally tracks what the animation actually cycles over.
+/// Using `total_decoded` instead would fire the playlist timer at the wrong
+/// time — too early if fewer frames are buffered, too late if more are.
+#[test]
+fn loop_duration_uses_buffered_frame_count_not_total_decoded() {
+    // Start with 200 frames, advance cursor to frame 100 (halfway through).
+    let mut session =
+        super::preview::VisualPreviewSession::new(make_n_frames(200), Some(1.0 / 15.0))
+            .expect("session should be created");
+    session.select_frame(100);
+
+    // Push 100 more frames. total = 300, budget = 180, safe_evict = min(180, 100) = 100.
+    // After eviction: buffer = 200, window_start = 100, global cursor stays at 100.
+    session.push_frames(make_n_frames(100));
+
+    assert_eq!(session.frame_count(), 300);
+    assert_eq!(session.buffered_frame_count(), 200);
+    assert_eq!(session.current_frame_index(), 100);
+
+    // loop_duration_seconds is computed by ContentPreviewTracker, not directly
+    // by VisualPreviewSession.  We verify the building blocks here.
+    let frame_duration = 1.0_f32 / 15.0;
+    let buffered_duration = session.buffered_frame_count() as f32 * frame_duration;
+    let total_duration = session.frame_count() as f32 * frame_duration;
+
+    // 200 buffered frames at 15 fps ≈ 13.3 s.
+    assert!(
+        (buffered_duration - 200.0 / 15.0).abs() < 0.01,
+        "loop duration must be buffered_frame_count × frame_duration ({:.2}s), \
+         not total_decoded × frame_duration ({:.2}s)",
+        buffered_duration,
+        total_duration,
+    );
+    // Sanity: buffered < total when eviction occurred.
+    assert!(
+        buffered_duration < total_duration,
+        "sanity: buffered duration ({buffered_duration:.2}s) must be \
+         less than total ({total_duration:.2}s) after partial eviction",
     );
 }

@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "=0.9.33"
 
 # Standalone IC crates (MIT/Apache-2.0, D076 Tier 1)
-cnc-formats = { version = "0.1.0-alpha.2", git = "https://github.com/iron-curtain-engine/cnc-formats.git", rev = "94f6efa32ca09a412399327a67fc5ac7519810c3", default-features = false }
+cnc-formats = { path = "../cnc-formats", default-features = false }
 fixed-game-math = { version = "0.1", git = "https://github.com/iron-curtain-engine/fixed-game-math.git" }
 deterministic-rng = { version = "0.1", git = "https://github.com/iron-curtain-engine/deterministic-rng.git" }
 

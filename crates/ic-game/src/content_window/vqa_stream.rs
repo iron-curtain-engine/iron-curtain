@@ -109,6 +109,9 @@ pub(crate) fn stream_vqa_decode(
     let mut audio_scratch = vec![0i16; audio_scratch_size];
 
     let mut batch_frames: Vec<RgbaSpriteFrame> = Vec::with_capacity(FRAMES_PER_BATCH);
+    // All audio is accumulated here and sent only with the final batch.
+    // `preview.rs` waits for `done = true` before constructing the PcmAudioSource
+    // and uses `rotate_audio_to_video_position` to handle A/V phase alignment.
     let mut all_audio: Vec<i16> = Vec::new();
     let mut is_first_frame = true;
 
@@ -118,6 +121,11 @@ pub(crate) fn stream_vqa_decode(
                 // Skip the first frame — already sent via the first-frame path.
                 if is_first_frame {
                     is_first_frame = false;
+                    // Drain audio eagerly: read_audio_samples calls pump_once
+                    // until the scratch buffer fills, buffering all remaining
+                    // video frames into frame_queue as a side effect.  Typically
+                    // this single call reads the entire file's audio into
+                    // all_audio; subsequent drain calls are no-ops.
                     if has_audio {
                         drain_audio(&mut decoder, &mut audio_scratch, &mut all_audio);
                     }
@@ -135,12 +143,12 @@ pub(crate) fn stream_vqa_decode(
                     batch_frames.push(rgba);
                 }
 
-                // Drain any audio decoded alongside this frame.
+                // Accumulate audio — it will be delivered in the final batch.
                 if has_audio {
                     drain_audio(&mut decoder, &mut audio_scratch, &mut all_audio);
                 }
 
-                // Send batch when full (video frames only; audio accumulates).
+                // Send a video-only batch when full.
                 if batch_frames.len() >= FRAMES_PER_BATCH {
                     let batch = VqaStreamBatch {
                         frames: std::mem::take(&mut batch_frames),
@@ -164,7 +172,7 @@ pub(crate) fn stream_vqa_decode(
         }
     }
 
-    // Send final batch with remaining frames + all accumulated audio.
+    // Final batch: remaining frames + all accumulated audio + metadata.
     let _ = sender.send(VqaStreamBatch {
         frames: batch_frames,
         audio_samples: all_audio,

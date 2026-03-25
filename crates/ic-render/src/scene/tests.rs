@@ -25,6 +25,7 @@ fn test_sheet() -> ShpRenderHandoff {
             ShpFrame {
                 frame_index: 0,
                 format: ic_cnc_content::cnc_formats::shp::ShpFrameFormat::Lcw,
+                file_offset: 0,
                 ref_offset: 0,
                 ref_format: 0,
                 encoded_len: 64,
@@ -32,6 +33,7 @@ fn test_sheet() -> ShpRenderHandoff {
             ShpFrame {
                 frame_index: 1,
                 format: ic_cnc_content::cnc_formats::shp::ShpFrameFormat::Lcw,
+                file_offset: 0,
                 ref_offset: 0,
                 ref_format: 0,
                 encoded_len: 64,

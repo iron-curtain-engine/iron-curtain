@@ -34,7 +34,7 @@ hound = "3.5"
 ic-cnc-content = { path = "../ic-cnc-content" }
 ic-render = { path = "../ic-render" }
 serde = { workspace = true }
-sysinfo = "0.37"
+sysinfo = "0.38.4"
 thiserror = "2.0.18"
 toml = "0.9.8"
 
