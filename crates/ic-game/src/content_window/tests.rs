@@ -1384,15 +1384,14 @@ fn aud_scomp_sos_decodes_without_chunk_header_corruption() {
     );
 }
 
-/// Proves that the content-lab window uses `AutoNoVsync` so the swapchain
-/// never times out during heavy background VQA decodes on integrated GPUs.
-///
-/// Regression: the default `AutoVsync` present mode panicked with
-/// `SurfaceError::Timeout` on Intel Xe when a 28 MB VQA took ~2.6 s to decode
-/// because memory-bus saturation prevented the GPU from acquiring the next
-/// frame before the vsync deadline.
+/// Verifies the default present mode is `FifoRelaxed` — no tearing during
+/// normal operation, but presents immediately on a missed deadline so
+/// simulation spikes, asset loads, and heavy ECS ticks don't cause
+/// frame-doubling stutter.  Falls back to `Fifo` on backends that don't
+/// support `FifoRelaxed`.  If `SurfaceError::Timeout` is observed on an
+/// integrated GPU under heavy load, set `vsync = "off"` in iron-curtain.toml.
 #[test]
-fn content_window_uses_auto_no_vsync_to_prevent_swapchain_timeout() {
+fn content_window_uses_fifo_relaxed_by_default() {
     use bevy::window::PresentMode;
 
     let display = crate::config::DisplayConfig::default();
@@ -1400,9 +1399,9 @@ fn content_window_uses_auto_no_vsync_to_prevent_swapchain_timeout() {
 
     assert_eq!(
         window.present_mode,
-        PresentMode::AutoNoVsync,
-        "the content-lab window must use AutoNoVsync so the GPU swapchain \
-         never times out during long background VQA decodes",
+        PresentMode::FifoRelaxed,
+        "the content-lab window should use FifoRelaxed by default \
+         for tear-free rendering with graceful missed-frame handling",
     );
 }
 

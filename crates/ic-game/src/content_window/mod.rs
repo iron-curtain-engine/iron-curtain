@@ -20,9 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bevy::prelude::*;
+use bevy::render::{ExtractSchedule, RenderApp};
 use bevy::window::{
     MonitorSelection, PresentMode, Window, WindowMode, WindowPlugin, WindowResolution,
 };
+use bevy_framepace::{FramepacePlugin, FramepaceSettings, Limiter};
 use ic_cnc_content::IcCncContentPlugin;
 use ic_render::IcRenderPlugin;
 
@@ -33,7 +35,7 @@ mod catalog;
 mod debug_overlay;
 mod gallery;
 mod preview;
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 mod preview_audio;
 mod preview_decode;
 mod state;
@@ -52,7 +54,7 @@ use preview::{
     setup_content_window_scene, sync_content_preview_audio_state, sync_content_preview_billboard,
     sync_scanlines_overlay, ContentPreviewTracker, ScanlinesMaterial,
 };
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 use preview_audio::register_preview_audio_source;
 use state::{
     handle_content_window_exit_shortcut, handle_content_window_input, refresh_content_window_text,
@@ -73,6 +75,14 @@ pub(crate) struct PlaybackSettings(pub(crate) crate::config::PlaybackConfig);
 #[derive(Resource, Debug, Clone)]
 #[allow(dead_code, reason = "audio volume will be consumed when the playback runtime reads it")]
 pub(crate) struct AudioSettings(pub(crate) crate::config::AudioConfig);
+
+/// Stores the focused and unfocused FPS cap values so the focus-change system
+/// can switch the `bevy_framepace` limiter without re-reading the TOML.
+#[derive(Resource, Debug, Clone, Copy)]
+struct PerformanceCapsSettings {
+    focused_fps_cap: u32,
+    unfocused_fps_cap: u32,
+}
 
 /// In-memory cache of entire archive files, keyed by their absolute path.
 ///
@@ -221,6 +231,13 @@ struct ContentCatalogScanTask {
 /// the middle of the screen. That makes the visible world surface match the
 /// selected RA asset rather than showing unrelated placeholder art.
 pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoSceneError> {
+    // ── Phase 1: resolve the graphics profile before app startup ─────────────
+    //
+    // The full dispatch (modern vs classic frontend) happens in a later phase.
+    // For now we resolve the effective profile, warn on unsupported choices,
+    // and carry the result into the app as a resource for the F3 overlay.
+    let resolved_profile = resolve_graphics_profile(&options);
+
     let source_roots = source_roots_from_config(&options.config);
     let content_state = ContentLabState::loading(source_roots);
     let (scan_task, archive_cache) = start_content_catalog_scan(
@@ -229,7 +246,13 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
     );
 
     let display = &options.config.display;
+    let perf = &options.config.performance;
     let cc = display.clear_color;
+
+    let caps = PerformanceCapsSettings {
+        focused_fps_cap: perf.fps_cap,
+        unfocused_fps_cap: perf.unfocused_fps_cap,
+    };
 
     let mut app = App::new();
     app.add_plugins(
@@ -240,14 +263,29 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
                 ..default()
             }),
     );
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     register_preview_audio_source(&mut app);
-    app.add_plugins(IcCncContentPlugin)
+    app.add_plugins(FramepacePlugin)
+        .add_plugins(IcCncContentPlugin)
         .add_plugins(IcRenderPlugin)
         .add_plugins(UiMaterialPlugin::<ScanlinesMaterial>::default())
         .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
         .add_plugins(bevy::diagnostic::SystemInformationDiagnosticsPlugin)
         .insert_resource(debug_overlay::DebugOverlayState::default())
+        .insert_resource(debug_overlay::GpuMetrics::default())
+        .insert_resource(resolved_profile);
+
+    // Register the GPU-info extraction system in the render sub-app so it can
+    // read RenderAdapterInfo (render world) and write GpuInfo back to the main
+    // world via MainWorld.  Runs once on the first frame then early-returns.
+    app.sub_app_mut(RenderApp)
+        .add_systems(ExtractSchedule, debug_overlay::extract_gpu_info);
+
+    app
+        .insert_resource(FramepaceSettings {
+            limiter: fps_cap_to_limiter(caps.focused_fps_cap),
+        })
+        .insert_resource(caps)
         .insert_resource(ClearColor(Color::srgb_u8(cc[0], cc[1], cc[2])))
         .insert_resource(content_state)
         .insert_resource(scan_task)
@@ -275,6 +313,13 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
                 .chain(),
         )
         .add_systems(
+            Startup,
+            // Windows-only PDH GPU utilization query.  Must run after
+            // setup_debug_overlay so the GpuMetrics resource already exists.
+            #[cfg(target_os = "windows")]
+            debug_overlay::setup_gpu_pdh,
+        )
+        .add_systems(
             Update,
             (
                 poll_content_catalog_scan,
@@ -300,34 +345,68 @@ pub fn run_content_window_client(options: LaunchOptions) -> Result<(), DemoScene
         .add_systems(
             Update,
             (
+                debug_overlay::refresh_gpu_metrics,
                 debug_overlay::toggle_debug_overlay,
                 debug_overlay::refresh_debug_overlay,
             )
                 .chain(),
-        );
+        )
+        .add_systems(Update, update_framepace_on_focus_change);
     app.run();
 
     Ok(())
 }
 
 fn content_lab_window(display: &crate::config::DisplayConfig) -> Window {
+    use crate::config::VsyncMode;
     let mode = match display.mode.as_str() {
         "windowed" => WindowMode::Windowed,
         "fullscreen" => WindowMode::Fullscreen(MonitorSelection::Primary, bevy::window::VideoModeSelection::Current),
         _ => WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
+    };
+    // Map config enum to Bevy's PresentMode.  FifoRelaxed (the default)
+    // avoids stutter from sim spikes without tearing during normal operation.
+    let present_mode = match display.vsync {
+        VsyncMode::Off         => PresentMode::AutoNoVsync,
+        VsyncMode::Auto        => PresentMode::AutoVsync,
+        VsyncMode::Fifo        => PresentMode::Fifo,
+        VsyncMode::Mailbox     => PresentMode::Mailbox,
+        VsyncMode::FifoRelaxed => PresentMode::FifoRelaxed,
     };
     Window {
         title: display.title.clone(),
         resolution: WindowResolution::new(display.width, display.height),
         mode,
         resizable: mode == WindowMode::Windowed,
-        // Use non-blocking present so the swapchain never times out during
-        // heavy background decodes (e.g. a 28 MB VQA taking 2+ seconds).
-        // AutoVsync (the default) blocks until the next vsync deadline and
-        // can panic with SurfaceError::Timeout on integrated GPUs when
-        // memory bandwidth is saturated by large buffer allocations.
-        present_mode: PresentMode::AutoNoVsync,
+        present_mode,
         ..default()
+    }
+}
+
+/// Converts a configured FPS cap to a `bevy_framepace` limiter.
+/// `0` → `Limiter::Auto` (matches the display's actual refresh rate).
+/// `N` → `Limiter::Manual` at exactly N fps.
+fn fps_cap_to_limiter(fps: u32) -> Limiter {
+    if fps == 0 {
+        Limiter::Auto
+    } else {
+        Limiter::from_framerate(fps as f64)
+    }
+}
+
+/// Swaps the framepace limiter when the window gains or loses focus so the
+/// unfocused cap kicks in automatically, saving CPU/GPU in the background.
+fn update_framepace_on_focus_change(
+    mut events: bevy::ecs::message::MessageReader<bevy::window::WindowFocused>,
+    caps: Res<PerformanceCapsSettings>,
+    mut framepace: ResMut<FramepaceSettings>,
+) {
+    for ev in events.read() {
+        framepace.limiter = fps_cap_to_limiter(if ev.focused {
+            caps.focused_fps_cap
+        } else {
+            caps.unfocused_fps_cap
+        });
     }
 }
 
@@ -494,6 +573,41 @@ fn process_memory_mb() -> f64 {
     sys.process(pid)
         .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
         .unwrap_or(0.0)
+}
+
+// ─── Graphics profile resolution ─────────────────────────────────────────────
+
+/// Resolves the effective graphics profile from config and CLI, and returns
+/// the [`ResolvedProfile`] resource to insert into the Bevy app.
+///
+/// **Phase 1 behaviour (config+policy only):**
+/// The classic frontend is not yet implemented.  Requesting `classic` or
+/// `gpu = "off"` logs a warning and falls back to the modern (Bevy) frontend.
+/// Phase 2 will add the actual frontend dispatch here before app startup.
+fn resolve_graphics_profile(options: &LaunchOptions) -> debug_overlay::ResolvedProfile {
+    use crate::config::{GpuPolicy, GraphicsProfile};
+
+    let cfg = &options.config.graphics;
+
+    // gpu = "off" forces classic regardless of profile.
+    let wants_classic = cfg.gpu == GpuPolicy::Off
+        || cfg.profile == GraphicsProfile::Classic;
+
+    if wants_classic {
+        eprintln!(
+            "[graphics] classic (non-GPU) frontend requested but not yet implemented. \
+             Falling back to modern frontend. (Phase 2 will add the classic path.)"
+        );
+    }
+
+    // Effective profile: auto resolves to enhanced for the modern frontend.
+    let effective = match cfg.profile {
+        GraphicsProfile::Auto => GraphicsProfile::Enhanced,
+        other => other,
+    };
+
+    // The modern Bevy frontend always runs with GPU active.
+    debug_overlay::ResolvedProfile { profile: effective, gpu_active: true }
 }
 
 #[cfg(test)]

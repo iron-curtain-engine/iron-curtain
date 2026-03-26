@@ -12,6 +12,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+bevy_framepace = "0.21.0"
 bevy = { version = "0.18.1", default-features = false, features = [
     "default_app",
     "bevy_core_pipeline",
@@ -28,7 +29,10 @@ bevy = { version = "0.18.1", default-features = false, features = [
     "png",
     "std",
     "sysinfo_plugin",
-    "x11",
+    "x11",      # Linux X11 display server
+    # "wayland" — blocked: winit 0.30.13 requires wayland-backend ^0.3.10 which
+    #             has not yet been published to crates.io (latest: 0.3.8).
+    #             Re-enable this feature once wayland-backend 0.3.10 is available.
 ] }
 hound = "3.5"
 ic-cnc-content = { path = "../ic-cnc-content" }
@@ -38,11 +42,20 @@ sysinfo = "0.38.4"
 thiserror = "2.0.18"
 toml = "0.9.8"
 
+# Native-only (non-WASM) dependencies.
+# Includes: allocator, audio playback.  Audio uses `rodio` under the hood via
+# `bevy_audio`, which works on Windows, Linux, macOS, Android, and iOS.
+# Web Audio API support is not yet implemented in Bevy — excluded from WASM.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = "0.1.43"
-
-[target.'cfg(windows)'.dependencies]
 bevy = { version = "0.18.1", default-features = false, features = [
     "bevy_audio",
     "wav",
+] }
+
+# Windows-only: DXGI (VRAM) + PDH (GPU utilisation) metrics via the system DLLs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Performance",
 ] }

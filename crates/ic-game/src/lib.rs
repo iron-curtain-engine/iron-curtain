@@ -33,6 +33,15 @@ pub struct LaunchOptions {
 
 impl LaunchOptions {
     /// Loads config from TOML, then applies CLI argument overrides.
+    ///
+    /// CLI precedence: CLI > user TOML > engine default.
+    /// Supported flags:
+    ///   `--preload-archives`
+    ///   `--windowed` / `--fullscreen`
+    ///   `--gpu off|on|auto|require`
+    ///   `--graphics classic|balanced|enhanced|studio|auto`
+    ///   `--vsync off|auto|fifo|mailbox|fifo-relaxed`
+    ///   `--fps-cap <N>` (0 = auto-detect from display refresh rate)
     pub fn from_env() -> Self {
         let config = config::GameConfig::load();
         let mut opts = Self {
@@ -40,13 +49,63 @@ impl LaunchOptions {
             config,
         };
 
-        for arg in std::env::args().skip(1) {
-            match arg.as_str() {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
                 "--preload-archives" => opts.preload_archives = true,
                 "--windowed" => opts.config.display.mode = "windowed".into(),
                 "--fullscreen" => opts.config.display.mode = "borderless-fullscreen".into(),
+                "--gpu" => {
+                    if let Some(val) = args.get(i + 1) {
+                        opts.config.graphics.gpu = match val.as_str() {
+                            "off" => config::GpuPolicy::Off,
+                            "on" => config::GpuPolicy::On,
+                            "require" => config::GpuPolicy::Require,
+                            _ => config::GpuPolicy::Auto,
+                        };
+                        i += 1;
+                    }
+                }
+                "--graphics" => {
+                    if let Some(val) = args.get(i + 1) {
+                        opts.config.graphics.profile = match val.as_str() {
+                            "classic" => config::GraphicsProfile::Classic,
+                            "balanced" => config::GraphicsProfile::Balanced,
+                            "enhanced" => config::GraphicsProfile::Enhanced,
+                            "studio" => config::GraphicsProfile::Studio,
+                            _ => config::GraphicsProfile::Auto,
+                        };
+                        i += 1;
+                    }
+                }
+                "--vsync" => {
+                    if let Some(val) = args.get(i + 1) {
+                        opts.config.display.vsync = match val.as_str() {
+                            "off"          => config::VsyncMode::Off,
+                            "auto"         => config::VsyncMode::Auto,
+                            "fifo"         => config::VsyncMode::Fifo,
+                            "mailbox"      => config::VsyncMode::Mailbox,
+                            "fifo-relaxed" => config::VsyncMode::FifoRelaxed,
+                            other => {
+                                eprintln!("[config] unknown --vsync value {other:?}, keeping default");
+                                opts.config.display.vsync
+                            }
+                        };
+                        i += 1;
+                    }
+                }
+                "--fps-cap" => {
+                    if let Some(val) = args.get(i + 1) {
+                        if let Ok(n) = val.parse::<u32>() {
+                            opts.config.performance.fps_cap = n;
+                        }
+                        i += 1;
+                    }
+                }
                 _ => {}
             }
+            i += 1;
         }
         opts
     }

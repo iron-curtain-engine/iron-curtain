@@ -20,6 +20,7 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct GameConfig {
     pub display: DisplayConfig,
+    pub graphics: GraphicsConfig,
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
     pub performance: PerformanceConfig,
@@ -32,12 +33,149 @@ impl Default for GameConfig {
     fn default() -> Self {
         Self {
             display: DisplayConfig::default(),
+            graphics: GraphicsConfig::default(),
             sources: Vec::new(),
             performance: PerformanceConfig::default(),
             playback: PlaybackConfig::default(),
             audio: AudioConfig::default(),
         }
     }
+}
+
+// ─── Graphics / profile config ───────────────────────────────────────────────
+
+/// Which rendering and feature profile to use for the frontend.
+///
+/// Determines whether a GPU renderer is required and which visual features
+/// are enabled.  The engine resolves `auto` at startup using hardware
+/// capabilities, user settings, and content requirements.
+///
+/// See the Content Lab GPU-optional architecture proposal for the full
+/// rollout plan (Phase 1 — config only; classic not yet implemented).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphicsProfile {
+    /// Resolve automatically from hardware, user settings, and content.
+    #[default]
+    Auto,
+    /// No GPU renderer — reduced browser and viewer, CPU-only path.
+    /// **Phase 1 placeholder:** selecting this profile prints a warning and
+    /// falls back to the modern frontend until the classic frontend is built.
+    Classic,
+    /// Modern GPU frontend, modest visuals, minimal power/heat.
+    Balanced,
+    /// Modern GPU frontend, richer effects (CRT, palette post-processing).
+    Enhanced,
+    /// Enhanced plus authoring, diagnostics, and developer features.
+    Studio,
+}
+
+impl GraphicsProfile {
+    /// Human-readable short label used in the F3 debug overlay.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Classic => "classic",
+            Self::Balanced => "balanced",
+            Self::Enhanced => "enhanced",
+            Self::Studio => "studio",
+        }
+    }
+
+    /// Whether this profile requires an active GPU renderer.
+    pub fn requires_gpu(self) -> bool {
+        !matches!(self, Self::Classic)
+    }
+}
+
+/// User-level GPU policy override — takes precedence over profile resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuPolicy {
+    /// Resolve automatically (recommended).
+    #[default]
+    Auto,
+    /// Force classic (non-GPU) frontend regardless of profile.
+    Off,
+    /// Prefer modern GPU frontend.
+    On,
+    /// Fail startup with a clear message if GPU frontend cannot initialise.
+    Require,
+}
+
+/// What to do if the requested frontend cannot start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackPolicy {
+    /// Fall back to the classic frontend (default).
+    #[default]
+    Classic,
+    /// Abort with a clear error message instead of falling back.
+    Fail,
+}
+
+/// Graphics and frontend profile configuration.
+///
+/// Controls which rendering frontend is launched, whether the GPU is required,
+/// and which visual effect buckets are enabled.
+///
+/// CLI flags (`--gpu`, `--graphics`, `--effects`) override these values.
+/// Precedence: CLI > user TOML > content/mod metadata > engine default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GraphicsConfig {
+    /// Rendering and feature profile (auto / classic / balanced / enhanced / studio).
+    pub profile: GraphicsProfile,
+    /// GPU policy override (auto / off / on / require).
+    pub gpu: GpuPolicy,
+    /// What to do if the chosen frontend cannot start (classic / fail).
+    pub fallback: FallbackPolicy,
+    /// Optional visual effect buckets to enable (e.g. `["scanlines", "crt-mask"]`).
+    pub effects: Vec<String>,
+}
+
+impl Default for GraphicsConfig {
+    fn default() -> Self {
+        Self {
+            profile: GraphicsProfile::Auto,
+            gpu: GpuPolicy::Auto,
+            fallback: FallbackPolicy::Classic,
+            effects: vec!["scanlines".into()],
+        }
+    }
+}
+
+/// V-sync / swap-chain present mode.
+///
+/// Controls how rendered frames are delivered to the display.  The default
+/// (`fifo-relaxed`) avoids frame-doubling stutter from simulation jitter or
+/// asset decode spikes without introducing tearing during normal operation.
+/// Falls back to strict FIFO if the backend doesn't support the relaxed
+/// variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum VsyncMode {
+    /// Non-blocking present — never stalls on a vsync deadline.
+    /// May produce visible tearing on some displays.  Use if
+    /// `SurfaceError::Timeout` occurs on an integrated GPU under heavy load.
+    Off,
+    /// Let the driver/OS choose the best available strategy (usually FIFO).
+    Auto,
+    /// Strict FIFO vsync — guaranteed no tearing, at the cost of up to one
+    /// frame of added latency.
+    Fifo,
+    /// Mailbox (triple-buffer) vsync — frames replace each other without
+    /// waiting for a deadline; lower latency than `fifo` but not universally
+    /// supported.
+    Mailbox,
+    /// Relaxed FIFO vsync — behaves like `fifo` when frames arrive on time, but
+    /// presents immediately (allowing a single tear) when a frame misses its
+    /// vblank deadline instead of waiting for the next one.  Eliminates the
+    /// frame-doubling stutter that strict `fifo` produces under variable load
+    /// (simulation spikes, asset decoding, heavy ECS ticks).  Best all-round
+    /// choice; falls back to `fifo` if the backend does not support it.
+    #[default]
+    FifoRelaxed,
 }
 
 /// Display / window configuration.
@@ -49,6 +187,8 @@ pub struct DisplayConfig {
     pub width: u32,
     pub height: u32,
     pub clear_color: [u8; 3],
+    /// V-sync / present mode (off / auto / fifo / mailbox / fifo-relaxed).
+    pub vsync: VsyncMode,
 }
 
 impl Default for DisplayConfig {
@@ -59,6 +199,12 @@ impl Default for DisplayConfig {
             width: 1280,
             height: 720,
             clear_color: [15, 20, 24],
+            // FifoRelaxed: no tearing in the common case, but presents
+            // immediately on a missed deadline instead of stalling — so
+            // simulation spikes, asset loads, and heavy ECS ticks don't
+            // cause frame-doubling stutters.  Falls back to Fifo on
+            // backends that don't support it.
+            vsync: VsyncMode::FifoRelaxed,
         }
     }
 }
@@ -90,14 +236,33 @@ fn default_shape() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PerformanceConfig {
+    /// Load entire MIX/MEG archives into RAM at startup for faster browsing.
     pub preload_archives: bool,
+    /// Maximum frames per second when the window is focused.
+    /// `0` = auto-detect from the display's refresh rate (recommended).
+    /// Set to a fixed value (e.g. `60`) to override.
+    pub fps_cap: u32,
+    /// Maximum frames per second when the window loses focus.
+    /// `0` = auto-detect from the display's refresh rate.
+    /// Must stay above `ceil(max_tps / MAX_TICKS_PER_FRAME)` (currently 13)
+    /// to prevent the simulation from falling behind — critical during
+    /// multiplayer lockstep where one player lagging starves every other.
+    pub unfocused_fps_cap: u32,
 }
 
 impl Default for PerformanceConfig {
-    #[allow(clippy::derivable_impls, reason = "explicit default documents the production value next to the struct")]
     fn default() -> Self {
         Self {
             preload_archives: false,
+            fps_cap: 0,
+            // The game loop processes up to MAX_TICKS_PER_FRAME (4) sim
+            // ticks per render frame.  At the Fastest game speed (50 tps)
+            // the renderer must run at least ceil(50/4) = 13 fps to avoid
+            // falling behind the simulation — critical during multiplayer
+            // lockstep where lagging starves every other player.
+            // 15 fps covers all speed presets with headroom and still cuts
+            // GPU load ~4× vs 60 fps.
+            unfocused_fps_cap: 15,
         }
     }
 }
@@ -360,5 +525,97 @@ mod tests {
             !config.playback.audio_dc_correction,
             "audio_dc_correction should be false when set in TOML"
         );
+    }
+
+    #[test]
+    fn graphics_defaults_to_auto_profile() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert_eq!(config.graphics.profile, GraphicsProfile::Auto);
+        assert_eq!(config.graphics.gpu, GpuPolicy::Auto);
+        assert_eq!(config.graphics.fallback, FallbackPolicy::Classic);
+    }
+
+    #[test]
+    fn graphics_effects_default_includes_scanlines() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert!(
+            config.graphics.effects.iter().any(|e| e == "scanlines"),
+            "default effects should include scanlines"
+        );
+    }
+
+    #[test]
+    fn graphics_profile_parses_from_toml() {
+        let toml = r#"
+            [graphics]
+            profile = "enhanced"
+            gpu = "require"
+            fallback = "fail"
+            effects = ["scanlines", "crt-mask"]
+        "#;
+        let config = GameConfig::from_toml(toml).unwrap();
+        assert_eq!(config.graphics.profile, GraphicsProfile::Enhanced);
+        assert_eq!(config.graphics.gpu, GpuPolicy::Require);
+        assert_eq!(config.graphics.fallback, FallbackPolicy::Fail);
+        assert_eq!(config.graphics.effects, ["scanlines", "crt-mask"]);
+    }
+
+    #[test]
+    fn graphics_classic_profile_parses() {
+        let toml = r#"[graphics]
+profile = "classic"
+gpu = "off""#;
+        let config = GameConfig::from_toml(toml).unwrap();
+        assert_eq!(config.graphics.profile, GraphicsProfile::Classic);
+        assert_eq!(config.graphics.gpu, GpuPolicy::Off);
+    }
+
+    #[test]
+    fn graphics_profile_requires_gpu_is_correct() {
+        assert!(!GraphicsProfile::Classic.requires_gpu());
+        assert!(GraphicsProfile::Balanced.requires_gpu());
+        assert!(GraphicsProfile::Enhanced.requires_gpu());
+        assert!(GraphicsProfile::Studio.requires_gpu());
+        assert!(GraphicsProfile::Auto.requires_gpu());
+    }
+
+    #[test]
+    fn vsync_defaults_to_fifo_relaxed() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert_eq!(config.display.vsync, VsyncMode::FifoRelaxed);
+    }
+
+    #[test]
+    fn vsync_parses_all_variants_from_toml() {
+        for (toml_val, expected) in [
+            ("off", VsyncMode::Off),
+            ("auto", VsyncMode::Auto),
+            ("fifo", VsyncMode::Fifo),
+            ("mailbox", VsyncMode::Mailbox),
+            ("fifo-relaxed", VsyncMode::FifoRelaxed),
+        ] {
+            let toml = format!("[display]\nvsync = \"{toml_val}\"");
+            let config = GameConfig::from_toml(&toml).unwrap();
+            assert_eq!(config.display.vsync, expected, "failed for vsync = {toml_val:?}");
+        }
+    }
+
+    #[test]
+    fn fps_cap_defaults() {
+        let config = GameConfig::from_toml("").unwrap();
+        assert_eq!(config.performance.fps_cap, 0, "fps_cap should default to 0 (auto)");
+        assert_eq!(config.performance.unfocused_fps_cap, 15, "unfocused_fps_cap should default to 15");
+    }
+
+    #[test]
+    fn fps_cap_parses_from_toml() {
+        let toml = r#"
+            [performance]
+            fps_cap = 60
+            unfocused_fps_cap = 15
+        "#;
+        let config = GameConfig::from_toml(toml).unwrap();
+        assert_eq!(config.performance.fps_cap, 60);
+        assert_eq!(config.performance.unfocused_fps_cap, 15);
     }
 }

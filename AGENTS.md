@@ -698,6 +698,80 @@ Do not claim a feature is complete without evidence:
 - CI output showing clean build + test pass
 - manual verification notes (if no automation exists yet)
 
+## GPU-Optional Architecture: Content Lab Frontend Profiles
+
+### Design intent (proposal accepted 2026-03-26)
+
+Content Lab must support two runtime paths:
+
+1. **Modern frontend** — current Bevy-rendered path (GPU required)
+2. **Classic frontend** — CPU-only browser, no Bevy renderer (to be built)
+
+**Do not** try to make the Bevy renderer work without a GPU.
+**Do** separate frontends cleanly and dispatch before renderer init.
+
+### Profiles
+
+| Profile | GPU | Visual features |
+|---------|-----|-----------------|
+| `classic` | No | Minimal; software scanlines only |
+| `balanced` | Yes | Basic preview surface, minimal effects |
+| `enhanced` | Yes | CRT effects, palette post-processing |
+| `studio` | Yes | Enhanced + authoring/diagnostics/dev overlays |
+| `auto` | resolves | Resolves from hardware + user settings + content |
+
+### GPU policy (`gpu` field)
+
+- `auto` — resolve automatically
+- `off` — force classic frontend
+- `on` — prefer modern frontend
+- `require` — abort if modern frontend cannot start
+
+### Fallback (`fallback` field)
+
+- `classic` — fall back to classic if chosen path unavailable
+- `fail` — abort with a clear message instead of falling back
+
+### Config location
+
+`crates/ic-game/src/config.rs` — `GraphicsConfig`, `GraphicsProfile`, `GpuPolicy`, `FallbackPolicy`
+
+`config/iron-curtain.default.toml` — `[graphics]` section with documented defaults
+
+### CLI overrides (higher precedence than TOML)
+
+- `--gpu off|on|auto|require`
+- `--graphics classic|balanced|enhanced|studio|auto`
+
+### Startup dispatch location
+
+`crates/ic-game/src/lib.rs` `LaunchOptions::from_env()` → parses CLI overrides
+`crates/ic-game/src/content_window/mod.rs` `resolve_graphics_profile()` → resolves effective profile
+
+### Rollout phases
+
+**Phase 1 (implemented):** Config types, CLI overrides, profile resolution, F3 overlay shows profile + GPU on/off.  Classic request logs a warning and falls back to modern frontend.
+
+**Phase 2:** Extract shared content/catalog/selection core (no direct render deps) into a shared module or new crate (`ic-content-core`).
+
+**Phase 3:** Build classic frontend MVP — browser UI, still-image preview, metadata pane, audio, basic animation.
+
+**Phase 4:** Profile-gated visual effect buckets, mod/content capability checks, startup refusal and fallback rules.
+
+### Key architectural invariant
+
+- `ic-render` remains modern-only (Bevy-facing)
+- `ic-content-core` (future) must **not** depend on `ic-render`
+- The classic frontend must **not** depend on `ic-render`
+- Frontend dispatch happens **before** Bevy app startup (renderer lifecycle constraint)
+
+### F3 overlay
+
+The debug overlay (`debug_overlay.rs`) shows:
+- Current window resolution (`Res: WxH`)
+- Active profile and GPU status (`Profile: enhanced  GPU: On/Off`)
+- GPU adapter name, backend, VRAM, utilization (Windows only)
+
 ## Current Implementation Target (Update Regularly)
 
 - Active milestone: `M1`

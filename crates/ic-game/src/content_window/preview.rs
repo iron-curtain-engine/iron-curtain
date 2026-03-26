@@ -15,7 +15,7 @@
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::thread;
 
@@ -28,11 +28,11 @@ use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, PlaybackSettings};
 
 use super::catalog::{ContentCatalog, ContentCatalogEntry, ContentFamily};
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 use super::preview_audio::PcmAudioSource;
 use super::state::ContentLabState;
 
@@ -523,9 +523,9 @@ pub(crate) struct ContentPreviewTracker {
     scanlines_overlay_entity: Option<Entity>,
     /// Material handle for the scanlines overlay (kept for uniform updates).
     scanlines_overlay_material: Option<Handle<ScanlinesMaterial>>,
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     audio_handle: Option<Handle<PcmAudioSource>>,
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     audio_entity: Option<Entity>,
 
     // --- State machine ---
@@ -560,7 +560,7 @@ pub(crate) struct ContentPreviewTracker {
 impl ContentPreviewTracker {
     // ── Asset cleanup ────────────────────────────────────────────────
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     fn clear_dynamic_assets(
         &mut self,
         images: &mut Assets<Image>,
@@ -582,7 +582,7 @@ impl ContentPreviewTracker {
         self.phase = PreviewPhase::Empty;
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     fn clear_dynamic_assets(&mut self, images: &mut Assets<Image>) {
         if let Some(handle) = self.display_image_handle.take() {
             images.remove(handle.id());
@@ -922,7 +922,7 @@ impl ContentPreviewTracker {
 
     // ── Runtime diagnostics ──────────────────────────────────────────
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     fn runtime_status(&self, audio_sink: Option<&AudioSink>) -> String {
         if self.is_loading() && !self.has_visual() {
             return "preview: loading in background\naudio: waiting for decoded preview\ntransport: unavailable during preparation".into();
@@ -987,7 +987,7 @@ impl ContentPreviewTracker {
         lines.join("\n")
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     fn runtime_status(&self) -> String {
         if self.is_loading() && !self.has_visual() {
             return "preview: loading in background\naudio: waiting for decoded preview\ntransport: unavailable during preparation".into();
@@ -1101,9 +1101,9 @@ impl ContentPreviewTracker {
     /// dummy image asset store so the test does not need a full Bevy world.
     pub(crate) fn test_clear_for_navigation(&mut self) {
         let mut images = bevy::asset::Assets::<bevy::prelude::Image>::default();
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_arch = "wasm32")]
         self.clear_dynamic_assets(&mut images);
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let mut audio =
                 bevy::asset::Assets::<super::preview_audio::PcmAudioSource>::default();
@@ -1152,15 +1152,15 @@ pub(crate) fn setup_content_window_scene(mut commands: Commands) {
 pub(crate) fn refresh_content_preview(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    #[cfg(target_os = "windows")] mut audio_sources: ResMut<Assets<PcmAudioSource>>,
+    #[cfg(not(target_arch = "wasm32"))] mut audio_sources: ResMut<Assets<PcmAudioSource>>,
     mut state: ResMut<ContentLabState>,
     mut tracker: ResMut<ContentPreviewTracker>,
     archive_cache: Res<super::ArchivePreloadCache>,
     handle_cache: Res<super::ArchiveHandleCache>,
     playback: Res<super::PlaybackSettings>,
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     existing_audio_entities: Query<(Entity, Option<&AudioSink>), With<ContentPreviewAudio>>,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     existing_audio_entities: Query<Entity, With<ContentPreviewAudio>>,
 ) {
     let selection = state.selected_location();
@@ -1174,20 +1174,20 @@ pub(crate) fn refresh_content_preview(
     // continues to play through the OS audio buffer for the remainder of the
     // frame — audible as a brief burst of stale audio when switching movies
     // quickly.
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     for (entity, sink) in &existing_audio_entities {
         if let Some(sink) = sink {
             sink.pause();
         }
         commands.entity(entity).despawn();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     for entity in &existing_audio_entities {
         commands.entity(entity).despawn();
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_arch = "wasm32"))]
     tracker.clear_dynamic_assets(&mut images, &mut audio_sources);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     tracker.clear_dynamic_assets(&mut images);
     tracker.current_selection = selection;
     tracker.reset_loop_state();
@@ -1238,15 +1238,15 @@ pub(crate) fn refresh_content_preview(
         load_preview_for_selected_entry(&entry, state.catalogs(), Some(&archive_cache), Some(&handle_cache)),
         &mut commands,
         &mut images,
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_arch = "wasm32"))]
         &mut audio_sources,
         &mut tracker,
     ) {
         Ok(Some(preview)) => {
             state.set_preview_summary(preview.summary_text());
-            #[cfg(target_os = "windows")]
+            #[cfg(not(target_arch = "wasm32"))]
             state.set_playback_summary(tracker.runtime_status(None));
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_arch = "wasm32")]
             state.set_playback_summary(tracker.runtime_status());
         }
         Ok(None) => {
@@ -1284,7 +1284,7 @@ pub(crate) fn poll_content_preview_load(
     mut commands: Commands,
     task: Option<Res<ContentPreviewLoadTask>>,
     mut images: ResMut<Assets<Image>>,
-    #[cfg(target_os = "windows")] mut audio_sources: ResMut<Assets<PcmAudioSource>>,
+    #[cfg(not(target_arch = "wasm32"))] mut audio_sources: ResMut<Assets<PcmAudioSource>>,
     mut state: ResMut<ContentLabState>,
     mut tracker: ResMut<ContentPreviewTracker>,
     playback: Res<super::PlaybackSettings>,
@@ -1359,7 +1359,7 @@ pub(crate) fn poll_content_preview_load(
                         &entry,
                         preview,
                         &mut commands,
-                        #[cfg(target_os = "windows")]
+                        #[cfg(not(target_arch = "wasm32"))]
                         &mut audio_sources,
                         &mut tracker,
                     )
@@ -1369,7 +1369,7 @@ pub(crate) fn poll_content_preview_load(
                         preview,
                         &mut commands,
                         &mut images,
-                        #[cfg(target_os = "windows")]
+                        #[cfg(not(target_arch = "wasm32"))]
                         &mut audio_sources,
                         &mut tracker,
                     )
@@ -1378,9 +1378,9 @@ pub(crate) fn poll_content_preview_load(
                 match result {
                     Ok(Some(preview)) => {
                         state.set_preview_summary(preview.summary_text());
-                        #[cfg(target_os = "windows")]
+                        #[cfg(not(target_arch = "wasm32"))]
                         state.set_playback_summary(tracker.runtime_status(None));
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(target_arch = "wasm32")]
                         state.set_playback_summary(tracker.runtime_status());
                     }
                     Ok(None) => {
@@ -1432,7 +1432,7 @@ pub(crate) fn poll_content_preview_load(
                         if let (Some(sample_rate), Some(channels)) =
                             (tracker.streaming_audio_sample_rate.take(), tracker.streaming_audio_channels.take())
                         {
-                            #[cfg(target_os = "windows")]
+                            #[cfg(not(target_arch = "wasm32"))]
                             {
                                 // Rotate the audio buffer so it starts at the
                                 // same point in the movie as the video.  During
@@ -1494,7 +1494,7 @@ pub(crate) fn poll_content_preview_load(
 /// The content lab deliberately uses media-player style controls so a single
 /// window can validate static art, animations, waveform-backed audio, and
 /// video-like resources without inventing a separate UI flow for each format.
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn handle_content_preview_input(
     mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -1537,7 +1537,7 @@ pub(crate) fn handle_content_preview_input(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn handle_content_preview_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut tracker: ResMut<ContentPreviewTracker>,
@@ -1592,7 +1592,7 @@ pub(crate) fn handle_content_preview_input(
 /// query would still find the old entity's sink and erroneously un-pause it,
 /// causing the previous movie's audio to play under the new movie's video.
 /// Targeting by entity avoids this zombie-sink race entirely.
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn sync_content_preview_audio_state(
     tracker: Res<ContentPreviewTracker>,
     audio_sink_query: Query<&AudioSink, With<ContentPreviewAudio>>,
@@ -1615,7 +1615,7 @@ pub(crate) fn sync_content_preview_audio_state(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn sync_content_preview_audio_state() {}
 
 /// Advances animated previews and keeps multi-frame video previews in sync.
@@ -1623,7 +1623,7 @@ pub(crate) fn sync_content_preview_audio_state() {}
 /// For pure visual animations such as WSA, the tracker uses a local timer.
 /// When audio exists too, such as VQA, the frame selection follows the audio
 /// position so the video preview stays aligned with the decoded soundtrack.
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn advance_content_preview_animation(
     time: Res<Time>,
     mut tracker: ResMut<ContentPreviewTracker>,
@@ -1730,7 +1730,7 @@ pub(crate) fn advance_content_preview_animation(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn advance_content_preview_animation(
     time: Res<Time>,
     mut tracker: ResMut<ContentPreviewTracker>,
@@ -1807,7 +1807,7 @@ pub(crate) fn advance_content_preview_animation(
 /// Unlike the static preview summary, this status can change every frame while
 /// audio or animation is playing. It is kept separate so the decode summary
 /// remains a stable description of the selected resource.
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn refresh_content_preview_status(
     tracker: Res<ContentPreviewTracker>,
     mut state: ResMut<ContentLabState>,
@@ -1820,7 +1820,7 @@ pub(crate) fn refresh_content_preview_status(
     state.set_playback_summary(tracker.runtime_status(audio_sink));
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn refresh_content_preview_status(
     tracker: Res<ContentPreviewTracker>,
     mut state: ResMut<ContentLabState>,
@@ -1963,10 +1963,10 @@ fn apply_prepared_preview(
     preview: Result<Option<PreparedContentPreview>, PreviewLoadError>,
     commands: &mut Commands,
     images: &mut Assets<Image>,
-    #[cfg(target_os = "windows")] audio_sources: &mut Assets<PcmAudioSource>,
+    #[cfg(not(target_arch = "wasm32"))] audio_sources: &mut Assets<PcmAudioSource>,
     tracker: &mut ContentPreviewTracker,
 ) -> Result<Option<PreparedContentPreview>, PreviewLoadError> {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     let _ = commands;
 
     let Some(preview) = preview? else {
@@ -1990,7 +1990,7 @@ fn apply_prepared_preview(
 
     // Build audio info and Bevy handles.
     let audio_info = preview.audio().map(|audio| {
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             tracker.audio_handle =
                 Some(audio_sources.add(PcmAudioSource::from_preview_audio(audio)));
@@ -2039,7 +2039,7 @@ fn upgrade_preview_with_full_decode(
     _entry: &ContentCatalogEntry,
     preview: Result<Option<PreparedContentPreview>, PreviewLoadError>,
     commands: &mut Commands,
-    #[cfg(target_os = "windows")] audio_sources: &mut Assets<PcmAudioSource>,
+    #[cfg(not(target_arch = "wasm32"))] audio_sources: &mut Assets<PcmAudioSource>,
     tracker: &mut ContentPreviewTracker,
 ) -> Result<Option<PreparedContentPreview>, PreviewLoadError> {
     let Some(preview) = preview? else {
@@ -2051,7 +2051,7 @@ fn upgrade_preview_with_full_decode(
     });
 
     let audio_info = preview.audio().map(|audio| {
-        #[cfg(target_os = "windows")]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             tracker.audio_handle =
                 Some(audio_sources.add(PcmAudioSource::from_preview_audio(audio)));
@@ -2062,7 +2062,7 @@ fn upgrade_preview_with_full_decode(
         }
     });
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_arch = "wasm32")]
     let _ = commands;
 
     let text_available = preview.text_body().is_some();
@@ -2214,7 +2214,7 @@ fn start_content_preview_load(
 /// the buffer so that the corresponding audio starts first.  Because the
 /// audio loops, the rotation is seamless: the total duration is unchanged
 /// and both audio and video wrap at the same period with the same phase.
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 fn rotate_audio_to_video_position(
     mut samples: Vec<i16>,
     sample_rate: u32,
@@ -2245,7 +2245,7 @@ fn rotate_audio_to_video_position(
     samples
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_arch = "wasm32"))]
 fn respawn_preview_audio_entity(commands: &mut Commands, tracker: &mut ContentPreviewTracker) {
     if let Some(entity) = tracker.audio_entity.take() {
         commands.entity(entity).despawn();

@@ -24,6 +24,22 @@ height = 720
 # Background clear colour (sRGB 0–255).
 clear_color = [15, 20, 24]
 
+# V-sync / swap-chain present mode.
+#   fifo-relaxed  (default) no tearing in the common case.  Presents
+#                 immediately (one torn frame) on a missed deadline instead
+#                 of waiting for the next vblank, so simulation jitter,
+#                 asset loads, or heavy ECS ticks don't cause frame-doubling
+#                 stutter.  Falls back to fifo if the backend doesn't
+#                 support it.
+#   off           non-blocking present — may tear but never stalls.  Use if
+#                 you see SurfaceError::Timeout on an integrated GPU under
+#                 heavy memory load.
+#   auto          let the driver/OS pick the best available strategy.
+#   fifo          strict vsync — no tearing, but waits for the next vblank on
+#                 a late frame (can stutter during heavy sim or decode load).
+#   mailbox       triple-buffer vsync — lower latency than fifo; not universal.
+vsync = "fifo-relaxed"
+
 # ─── Content sources ────────────────────────────────────────────────────────
 #
 # Each [[sources]] entry adds one content root to the lab.
@@ -54,12 +70,60 @@ clear_color = [15, 20, 24]
 # rights = "owned-proprietary"
 # shape = "directory"
 
+# ─── Graphics / rendering profile ───────────────────────────────────────────
+#
+# Controls which frontend is launched and which visual effect buckets are
+# enabled.  CLI flags --graphics, --gpu, and --effects override these values.
+#
+# profile — "auto" | "classic" | "balanced" | "enhanced" | "studio"
+#   auto     resolve from hardware, user settings, and content requirements
+#   classic  no GPU renderer — CPU-only browser (NOT YET IMPLEMENTED; falls
+#            back to modern frontend with a warning during Phase 1)
+#   balanced modern GPU frontend, minimal effects and power draw
+#   enhanced modern GPU frontend, richer CRT/palette effects
+#   studio   enhanced + authoring, diagnostics, and developer-only features
+#
+# gpu — "auto" | "off" | "on" | "require"
+#   auto     resolve automatically
+#   off      force classic (non-GPU) frontend
+#   on       prefer modern GPU frontend
+#   require  abort startup if GPU frontend cannot initialise
+#
+# fallback — "classic" | "fail"
+#   classic  fall back to classic frontend if chosen path is unavailable
+#   fail     abort with a clear message instead of falling back
+#
+# effects — list of visual effect buckets to enable
+#   e.g. ["scanlines", "crt-mask", "postfx"]
+
+[graphics]
+profile = "auto"
+gpu = "auto"
+fallback = "classic"
+effects = ["scanlines"]
+
 # ─── Performance ────────────────────────────────────────────────────────────
 
 [performance]
 # Load entire MIX/MEG archives into RAM at startup for faster browsing.
 # Trades memory for speed — good for machines with plenty of RAM.
 preload_archives = false
+
+# Maximum rendered frames per second when the window is focused.
+# 0 = auto-detect from the display's refresh rate (recommended — avoids
+#     rendering more frames than the display can show, saves power).
+# Set to a fixed value (e.g. 60) to override.
+fps_cap = 0
+
+# Maximum rendered frames per second when the window loses focus.
+# 0 = auto-detect from display refresh rate.
+# The game loop processes up to 4 simulation ticks per render frame.
+# At the Fastest game speed (50 tps) the renderer must run at least
+# ceil(50/4) = 13 fps to keep the simulation from falling behind —
+# critical in multiplayer lockstep where one player lagging starves
+# every other player.  15 fps covers all speed presets with headroom
+# while still cutting GPU load ~4× vs 60 fps.
+unfocused_fps_cap = 15
 
 # ─── Playback ───────────────────────────────────────────────────────────────
 
