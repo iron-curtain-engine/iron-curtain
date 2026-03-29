@@ -259,15 +259,13 @@ fn video_preview_surface_policy_uses_movie_mode_budget() {
     assert_eq!(video_policy.max_height_fraction, 0.96);
 }
 
-/// Proves that preview preparation is pushed to a background task for real
-/// video playback instead of blocking the Bevy update thread.
-///
-/// `cnc-formats` currently exposes whole-file VQA decode, so the best local
-/// runtime policy is to move that work off the main thread while keeping the
-/// UI responsive. Static art, VQP palette tables, and WSA animations still
-/// use the simpler immediate path.
+/// Proves that preview preparation is pushed to a background task for
+/// formats that are expensive to decode (VQA video, WSA animations, AUD
+/// audio), preventing the Bevy update thread from blocking.  Lightweight
+/// formats (VQP palette tables, static SHP art) still use the immediate
+/// path.
 #[test]
-fn video_preview_policy_uses_background_loading() {
+fn heavy_preview_formats_use_background_loading() {
     let vqa_entry = ContentCatalogEntry {
         relative_path: "MOVIE.VQA".into(),
         location: ContentEntryLocation::Filesystem {
@@ -275,6 +273,24 @@ fn video_preview_policy_uses_background_loading() {
         },
         size_bytes: 100,
         family: ContentFamily::Video,
+        support: ContentSupportLevel::SupportedNow,
+    };
+    let wsa_entry = ContentCatalogEntry {
+        relative_path: "ANIM.WSA".into(),
+        location: ContentEntryLocation::Filesystem {
+            absolute_path: PathBuf::from("/dummy/ANIM.WSA"),
+        },
+        size_bytes: 100,
+        family: ContentFamily::Video,
+        support: ContentSupportLevel::SupportedNow,
+    };
+    let aud_entry = ContentCatalogEntry {
+        relative_path: "SPEECH.AUD".into(),
+        location: ContentEntryLocation::Filesystem {
+            absolute_path: PathBuf::from("/dummy/SPEECH.AUD"),
+        },
+        size_bytes: 100,
+        family: ContentFamily::Audio,
         support: ContentSupportLevel::SupportedNow,
     };
     let vqp_entry = ContentCatalogEntry {
@@ -296,6 +312,8 @@ fn video_preview_policy_uses_background_loading() {
         support: ContentSupportLevel::SupportedNow,
     };
     assert!(super::preview::should_background_load_preview(&vqa_entry));
+    assert!(super::preview::should_background_load_preview(&wsa_entry));
+    assert!(super::preview::should_background_load_preview(&aud_entry));
     assert!(!super::preview::should_background_load_preview(&vqp_entry));
     assert!(!super::preview::should_background_load_preview(&shp_entry));
 }
@@ -2470,4 +2488,109 @@ fn indexed_frame_to_rgba_no_dither_is_deterministic() {
         second.rgba8_pixels(),
         "undithered conversion must be deterministic"
     );
+}
+
+// ── PCX palette extraction ─────────────────────────────────────────────────
+
+#[test]
+fn extract_pcx_palette_returns_6bit_vga_from_valid_tail() {
+    // Build a minimal PCX-like blob: arbitrary header + 0x0C sentinel + 768
+    // bytes of 8-bit RGB palette data at the tail.
+    let mut pcx = vec![0u8; 200]; // fake PCX header/pixel data
+    pcx.push(0x0C); // palette sentinel
+    for i in 0u16..256 {
+        // 8-bit RGB channels: R = i, G = 255-i, B = i/2
+        pcx.push((i & 0xFF) as u8);
+        pcx.push((255 - (i & 0xFF)) as u8);
+        pcx.push(((i / 2) & 0xFF) as u8);
+    }
+
+    let pal_bytes = super::preview_decode::extract_pcx_palette(&pcx)
+        .expect("valid PCX tail should yield a palette");
+    assert_eq!(pal_bytes.len(), 768);
+    // First entry (index 0): R=0>>2=0, G=255>>2=63, B=0>>2=0
+    assert_eq!(pal_bytes[0], 0);
+    assert_eq!(pal_bytes[1], 63);
+    assert_eq!(pal_bytes[2], 0);
+    // Entry 128: R=128>>2=32, G=127>>2=31, B=64>>2=16
+    assert_eq!(pal_bytes[128 * 3], 32);
+    assert_eq!(pal_bytes[128 * 3 + 1], 31);
+    assert_eq!(pal_bytes[128 * 3 + 2], 16);
+}
+
+#[test]
+fn extract_pcx_palette_rejects_missing_sentinel() {
+    let mut pcx = vec![0u8; 200];
+    pcx.push(0x00); // wrong sentinel
+    pcx.extend_from_slice(&[0u8; 768]);
+    assert!(super::preview_decode::extract_pcx_palette(&pcx).is_none());
+}
+
+#[test]
+fn extract_pcx_palette_rejects_too_short() {
+    let pcx = vec![0u8; 100]; // shorter than 769 bytes
+    assert!(super::preview_decode::extract_pcx_palette(&pcx).is_none());
+}
+
+/// Proves that a score-screen SHP inside a MIX archive picks up the palette
+/// embedded in a co-located PCX background rather than falling back to the
+/// generic theater palette from a sibling archive.
+#[test]
+fn score_shp_uses_pcx_palette_from_mix_sibling() {
+    let fixture = TestDir::new("content_window_pcx_palette");
+    // Pack a score-screen SHP and its PCX background into one MIX, just like
+    // the real RA1 CONQUER.MIX layout.
+    fixture.write_file(
+        "CONQUER.MIX",
+        &build_named_mix(&[
+            ("HISC1-HR.SHP", &test_shp_bytes()),
+            ("ALIBACKH.PCX", &build_test_pcx(&[60, 20, 10])),
+        ]),
+    );
+    // A separate archive provides TEMPERAT.PAL — if the PCX path works
+    // correctly this palette will NOT be chosen.
+    fixture.write_file(
+        "LOCAL.MIX",
+        &build_named_mix(&[(
+            "TEMPERAT.PAL",
+            &test_palette_bytes([32, 32, 32], [16, 16, 16]),
+        )]),
+    );
+
+    let catalog = ContentCatalog::scan(ContentSourceRoot::directory(
+        "Fixture",
+        fixture.path().to_path_buf(),
+        ContentSourceKind::ManualDirectory,
+        SourceRightsClass::OwnedProprietary,
+    ));
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|e| e.relative_path.contains("HISC1-HR.SHP"))
+        .cloned()
+        .expect("the mounted score SHP should exist");
+
+    let preview = super::preview::load_preview_for_entry(&entry, &[catalog], None, None)
+        .expect("preview loading should succeed")
+        .expect("score SHP should be previewable");
+
+    assert!(
+        preview.summary_text().contains("ALIBACKH.PCX"),
+        "score SHP should use the PCX-embedded palette, got: {}",
+        preview.summary_text(),
+    );
+}
+
+/// Builds a minimal synthetic PCX whose embedded 256-color palette has the
+/// given 8-bit RGB triple at index 1 (index 0 stays black).
+fn build_test_pcx(index1_rgb8: &[u8; 3]) -> Vec<u8> {
+    let mut pcx = vec![0u8; 128]; // minimal PCX header
+    pcx[0] = 0x0A; // PCX magic
+    pcx[3] = 8; // bits per pixel
+    pcx.extend_from_slice(&[0u8; 64]); // dummy pixel data
+    pcx.push(0x0C); // palette sentinel
+    pcx.extend_from_slice(&[0, 0, 0]); // index 0: black
+    pcx.extend_from_slice(index1_rgb8); // index 1: distinctive color
+    pcx.extend_from_slice(&[0u8; 254 * 3]); // indices 2–255: black
+    pcx
 }

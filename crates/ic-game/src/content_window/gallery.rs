@@ -586,8 +586,9 @@ fn build_static_thumbnail(
     archive_cache: &super::ArchivePreloadCache,
     handle_cache: &super::ArchiveHandleCache,
 ) -> (Option<Handle<Image>>, Option<ContainedImageSize>) {
-    // Videos are too expensive to decode synchronously for thumbnails.
-    // The selected entry uses the streaming preview tracker instead.
+    // Heavy formats (VQA, WSA, AUD) are too expensive to decode
+    // synchronously for gallery thumbnails.  The selected entry uses
+    // the background preview tracker instead.
     if super::preview::should_background_load_preview(entry) {
         return (None, None);
     }

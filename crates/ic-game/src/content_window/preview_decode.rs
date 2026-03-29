@@ -38,6 +38,29 @@ const DEFAULT_PALETTE_NAMES: &[&str] = &["TEMPERAT.PAL", "SNOW.PAL", "INTERIOR.P
 const SNOW_PALETTE_NAMES: &[&str] = &["SNOW.PAL", "TEMPERAT.PAL", "INTERIOR.PAL", "EGOPAL.PAL"];
 const INTERIOR_PALETTE_NAMES: &[&str] = &["INTERIOR.PAL", "TEMPERAT.PAL", "SNOW.PAL", "EGOPAL.PAL"];
 const EGO_PALETTE_NAMES: &[&str] = &["EGOPAL.PAL", "TEMPERAT.PAL", "SNOW.PAL", "INTERIOR.PAL"];
+/// Standalone `.PAL` fallback for score/multiplayer entries.  The primary
+/// palette source for score-screen SHPs is the PCX background (see
+/// [`SCORE_PCX_NAMES`]).  These `.PAL` names are tried only when no PCX
+/// palette is available.
+const SCORE_PALETTE_NAMES: &[&str] = &[
+    "MULTSCOR.PAL",
+    "SCORE.PAL",
+    "SCORPAL1.PAL",
+    "TEMPERAT.PAL",
+    "SNOW.PAL",
+];
+/// Palettes for mission-selection map WSAs (MSA*.WSA / MSS*.WSA).
+const MAP_PALETTE_NAMES: &[&str] = &[
+    "MAP.PAL",
+    "MAP1.PAL",
+    "TEMPERAT.PAL",
+    "SNOW.PAL",
+];
+/// PCX backgrounds whose embedded palettes are used by score/credits SHPs.
+/// RA1's score screen loads ALIBACKH.PCX (Allied) or SOVBACKH.PCX (Soviet)
+/// via `Load_Title_Screen` which also sets the active palette.  These PCX
+/// files live in CONQUER.MIX alongside the SHPs that depend on them.
+const SCORE_PCX_NAMES: &[&str] = &["ALIBACKH.PCX", "SOVBACKH.PCX"];
 const DEFAULT_ANIMATION_FPS: f32 = 12.0;
 const WAVEFORM_WIDTH: u32 = 512;
 const WAVEFORM_HEIGHT: u32 = 160;
@@ -681,34 +704,13 @@ fn read_nested_via_seek<R: std::io::Read + std::io::Seek>(
         })
 }
 
-/// Parses an SHP file, retrying when the sentinel entry's `format_byte` is
-/// non-zero.
+/// Parses an SHP file via the standard `ShpSprite::parse` path.
 ///
-/// `cnc-formats` >= 0.1.0-alpha.4 already accepts non-zero `ref_offset` /
-/// `ref_format` in the EOF sentinel (our upstream fix).  A smaller set of
-/// RA1 files (e.g. MOUSE.SHP, EDMOUSE.SHP) additionally have a non-zero
-/// `format_byte` in that entry.  `format_byte` carries no meaning for the
-/// sentinel — only `file_offset` is used — so we zero the field and retry.
+/// The underlying `cnc-formats` parser already accepts non-zero garbage
+/// in the EOF sentinel and padding entries (matching original Westwood
+/// tool behaviour), so no client-side patching is needed.
 fn parse_shp_lenient(bytes: Vec<u8>) -> Result<ShpSprite, cnc_formats::Error> {
-    match ShpSprite::parse(bytes.clone()) {
-        Ok(shp) => return Ok(shp),
-        Err(cnc_formats::Error::InvalidMagic { context: "SHP EOF sentinel" }) => {}
-        Err(e) => return Err(e),
-    }
-    // SHP header: frame_count at bytes 0..2 (LE u16); header = 14 bytes.
-    // Offset-table entries are 8 bytes: [u32 (fmt_byte<<24 | file_offset), u16, u16].
-    // Byte 3 of each entry (0-indexed within the entry) is the high byte of
-    // the u32 in little-endian, i.e. the format_byte field.
-    let mut patched = bytes;
-    let frame_count = match patched.get(0..2) {
-        Some(b) => u16::from_le_bytes([b[0], b[1]]) as usize,
-        None => return ShpSprite::parse(patched),
-    };
-    let sentinel_start = 14 + frame_count * 8;
-    if sentinel_start + 4 <= patched.len() {
-        patched[sentinel_start + 3] = 0; // zero the format_byte
-    }
-    ShpSprite::parse(patched)
+    ShpSprite::parse(bytes)
 }
 
 fn load_shp_preview(
@@ -974,6 +976,7 @@ fn load_wsa_preview(
 ) -> Result<PreparedContentPreview, PreviewLoadError> {
     let bytes = load_entry_bytes(entry)?;
     let wsa = cnc_formats::wsa::WsaFile::parse(&bytes)?;
+
     let embedded_palette = wsa.palette.map(|palette| palette.to_vec());
     let (palette, palette_label) = palette_for_indexed_visual(entry, catalogs, embedded_palette)?;
     let render_palette = PaletteTextureSource::from_handoff(palette.render_handoff());
@@ -1354,6 +1357,12 @@ fn palette_for_indexed_visual(
         ));
     }
 
+    // Score/credits SHPs use palettes embedded in PCX backgrounds rather than
+    // standalone .PAL files.  Try those before the generic .PAL fallback.
+    if let Some(pcx_result) = try_pcx_palette_for_visual(entry, catalogs) {
+        return Ok(pcx_result);
+    }
+
     let palette_entry = resolve_palette_entry_for_visual(entry, catalogs).ok_or_else(|| {
         PreviewLoadError::MissingPalette {
             entry_path: entry.relative_path.clone(),
@@ -1683,12 +1692,32 @@ fn preview_control_hint(has_animation: bool, has_audio: bool) -> String {
 
 fn preferred_palette_names_for_visual(entry: &ContentCatalogEntry) -> &'static [&'static str] {
     let path_upper = entry.relative_path.to_ascii_uppercase();
+    let name_upper = entry_file_name_upper(entry);
     if path_upper.contains("SNOW") {
         SNOW_PALETTE_NAMES
     } else if path_upper.contains("INTERIOR") {
         INTERIOR_PALETTE_NAMES
     } else if path_upper.contains("EGO") {
         EGO_PALETTE_NAMES
+    } else if name_upper.starts_with("MSA")
+        || name_upper.starts_with("MSS")
+        || name_upper.starts_with("MAP")
+    {
+        // Mission-selection map animations (MSAB.WSA, MSSA.WSA, etc.)
+        MAP_PALETTE_NAMES
+    } else if name_upper.contains("SCORE")
+        || name_upper.starts_with("HISC")
+        || name_upper.starts_with("TIME")
+        || name_upper.starts_with("BAR3")
+        || name_upper.contains("MLTIPLYR")
+        || name_upper.contains("TRAN")
+        || name_upper.contains("MULTSCOR")
+        || name_upper.starts_with("CREDS")
+    {
+        // Score/hiscore screens (HISCORE1, HISC1-HR, TIME, TIMEHR),
+        // score bars (BAR3BLU, BAR3RHR, BAR3BHR, BAR3RED),
+        // credits (CREDSA, CREDSAHR), multiplayer lobby, transitions.
+        SCORE_PALETTE_NAMES
     } else {
         DEFAULT_PALETTE_NAMES
     }
@@ -1707,6 +1736,50 @@ pub(crate) fn entry_extension_lower(entry: &ContentCatalogEntry) -> Option<Strin
 
 fn entry_file_name_upper(entry: &ContentCatalogEntry) -> String {
     entry.location.file_name_upper()
+}
+
+/// Extracts the 256-color palette from the tail of a PCX file.
+///
+/// VGA PCX files store their palette in the last 769 bytes: a `0x0C` sentinel
+/// followed by 768 bytes of 8-bit RGB data.  The returned `Vec<u8>` contains
+/// 768 bytes in 6-bit VGA format (each channel right-shifted by 2) so the
+/// result can be passed directly to [`Palette::parse`].
+pub(crate) fn extract_pcx_palette(pcx_data: &[u8]) -> Option<Vec<u8>> {
+    if pcx_data.len() < 769 {
+        return None;
+    }
+    let tail = &pcx_data[pcx_data.len() - 769..];
+    if tail[0] != 0x0C {
+        return None;
+    }
+    // Convert 8-bit RGB → 6-bit VGA range expected by Palette::parse.
+    Some(tail[1..].iter().map(|&b| b >> 2).collect())
+}
+
+/// Attempts to resolve a palette from a co-located PCX file for entries that
+/// the RA1 engine renders with a PCX background palette (score screen, credits).
+fn try_pcx_palette_for_visual(
+    entry: &ContentCatalogEntry,
+    catalogs: &[ContentCatalog],
+) -> Option<(Palette, String)> {
+    let preferred = preferred_palette_names_for_visual(entry);
+    if !std::ptr::eq(preferred, SCORE_PALETTE_NAMES) {
+        return None;
+    }
+    for &pcx_name in SCORE_PCX_NAMES {
+        let pcx_entry = catalogs
+            .iter()
+            .flat_map(|c| c.entries.iter())
+            .find(|e| entry_file_name_upper(e) == pcx_name)?;
+        if let Ok(pcx_bytes) = load_entry_bytes(pcx_entry) {
+            if let Some(pal_bytes) = extract_pcx_palette(&pcx_bytes) {
+                if let Ok(palette) = Palette::parse(pal_bytes) {
+                    return Some((palette, format!("{} (embedded)", pcx_entry.relative_path)));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn trimmed_text_excerpt(text: &str) -> String {

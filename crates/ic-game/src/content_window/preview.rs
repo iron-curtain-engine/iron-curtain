@@ -77,14 +77,15 @@ pub(crate) fn preview_surface_policy_for_family(
 }
 
 /// Returns `true` when preview preparation should happen off the main Bevy
-/// thread via the VQA streaming decoder.
+/// thread to avoid blocking the UI.
 ///
-/// Only `.vqa` files use the VQA streaming path. Other video-family formats
-/// (`.vqp`, `.wsa`, `.bk2`) have their own decoders routed through the
-/// normal `load_preview_for_entry` path and don't need background loading.
+/// `.vqa` files use the VQA streaming path (first frame + incremental
+/// batches).  Other heavy formats (`.wsa` animations, `.aud` audio) use
+/// the non-streaming background path: a single full decode on a worker
+/// thread with the result delivered via `PreviewLoadMessage::Full`.
 pub(crate) fn should_background_load_preview(entry: &super::catalog::ContentCatalogEntry) -> bool {
-    entry.family == ContentFamily::Video
-        && super::preview_decode::entry_extension_lower(entry).as_deref() == Some("vqa")
+    let ext = super::preview_decode::entry_extension_lower(entry);
+    matches!(ext.as_deref(), Some("vqa" | "wsa" | "aud"))
 }
 
 /// Marker for the visible world-space fallback surface that mirrors the
@@ -1208,8 +1209,9 @@ pub(crate) fn refresh_content_preview(
         state.set_playback_summary("No active preview runtime.");
         return;
     };
-    tracker.is_vqa = should_background_load_preview(&entry);
-    if tracker.is_vqa {
+    tracker.is_vqa = entry.family == ContentFamily::Video
+        && super::preview_decode::entry_extension_lower(&entry).as_deref() == Some("vqa");
+    if should_background_load_preview(&entry) {
         tracker.begin_loading(entry.family);
         state.set_preview_summary(format!(
             "Loading preview for {}...\nFirst frame will appear momentarily while remaining frames decode in the background.",
@@ -2084,12 +2086,15 @@ fn start_content_preview_load(
     audio_post: super::vqa_stream::AudioPostProcess,
 ) -> ContentPreviewLoadTask {
     let (sender, receiver) = mpsc::channel();
-    let is_video = should_background_load_preview(&entry);
+    // Only VQA files use the streaming decoder; other heavy formats
+    // (WSA, AUD) take the simpler full-decode-then-send path below.
+    let is_vqa = entry.family == ContentFamily::Video
+        && super::preview_decode::entry_extension_lower(&entry).as_deref() == Some("vqa");
 
     thread::Builder::new()
         .name("ic-content-preview-load".into())
         .spawn(move || {
-            if is_video {
+            if is_vqa {
                 // Streaming VQA path: read file once, decode first frame for
                 // instant display, then stream remaining frames incrementally.
                 let t0 = std::time::Instant::now();
